@@ -1,49 +1,62 @@
 import requests
 import json
+from ingestion.helpers import get_cookies  
+from db.insert_data import insert_all_fetched_job_ids, insert_job_details 
+import sqlite3
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+
+
+conn = sqlite3.connect("jobs.db")
+cursor = conn.cursor()
 
 class LinkedInJobsSearcher:
     def __init__(self):
         self.session = requests.Session()
-        self.headers = {
+        for cookie in get_cookies():
+            self.session.cookies.set(cookie["name"], cookie["value"])
+
+        self.session.headers = {
             "User-Agent": "Mozilla/5.0",
-            "Cookie": "Cookie",
-            "Csrf-Token": "ajax:0433998784187860844",
+            "Csrf-Token": self.session.cookies["JSESSIONID"].strip('"'),
             "Accept": "application/vnd.linkedin.normalized+json+2.1",
+            "Cookie": "; ".join([f"{key}={value}" for key, value in self.session.cookies.items()]),
             "Accept-Encoding": "gzip, deflate, br, zstd",
             "Accept-Language": "en-US,en;q=0.9",
             "Referer": "https://www.linkedin.com/preload/"
         }
-        self.search_url = "https://www.linkedin.com/voyager/api/voyagerJobsDashJobCards?decorationId=com.linkedin.voyager.dash.deco.jobs.search.JobSearchCardsCollection-220&count=10&q=jobSearch&query=(origin:JOB_SEARCH_PAGE_JOB_FILTER,keywords:data%20scientist,locationUnion:(geoId:102713980),selectedFilters:(experience:List(2,3)),spellCorrectionEnabled:true)&start=100"
+        self.search_url = "https://www.linkedin.com/voyager/api/voyagerJobsDashJobCards?decorationId=com.linkedin.voyager.dash.deco.jobs.search.JobSearchCardsCollection-220&count=100&q=jobSearch&query=(origin:JOB_SEARCH_PAGE_JOB_FILTER,keywords:data%20scientist,locationUnion:(geoId:102713980),selectedFilters:(experience:List(2,3)),spellCorrectionEnabled:true)&start=0"
         
     def fetch_jobs(self):
         try:
-            resp_jobs = self.session.get(url=self.url, headers=self.headers)
+            resp_jobs = self.session.get(url=self.search_url, headers=self.session.headers)
             resp_jobs.raise_for_status()
             if resp_jobs.status_code==200:
-                jobs_json = resp_jobs.json()
+                jobs = resp_jobs.json()
                 with open("jobs.json",'w') as file:
-                    json.dump(jobs_json, file, indent=4)
-                return jobs_json
+                    json.dump(jobs, file, indent=4)
+                    
+                total_jobs_fetched = jobs['data']['paging']['total']
+                print("Total number of jobs available from URL: ", total_jobs_fetched)
+                job_id_list = []
+                for element in jobs['data']['elements']:
+                    if "JobCard" in element["$type"]:
+                        jobPostingCard = element["jobCardUnion"]["*jobPostingCard"]
+                        job_id_list.append(jobPostingCard.split("(")[1].split(',')[0])
+                        
+                insert_all_fetched_job_ids(job_id_list)
         except Exception as e:
             raise SystemExit(e)
-
-    def parse_json_job_list(self,jobs):
-        total_jobs_fetched = jobs['data']['paging']['total']
-        print("Total number of jobs available from URL: ", total_jobs_fetched)
-        job_id_list = []
-        for element in jobs['data']['elements']:
-            if "JobCard" in element["$type"]:
-                jobPostingCard = element["jobCardUnion"]["*jobPostingCard"]
-                job_id_list.append(jobPostingCard.split("(")[1].split(',')[0])
-        return job_id_list    
 
 class LinkedInJobRetriever:
     def __init__(self):
         self.session = requests.Session()
-        self.headers = {
+        for cookie in get_cookies():
+            self.session.cookies.set(cookie["name"], cookie["value"])
+        self.session.headers = {
             "User-Agent": "Mozilla/5.0",
-            "Cookie": "Cookie",
-            "Csrf-Token": "ajax:0433998784187860844",
+            "Cookie": "; ".join([f"{key}={value}" for key,value in self.session.cookies.items()]),
+            "Csrf-Token": self.session.cookies["JSESSIONID"].strip('"'),
             "Accept": "application/vnd.linkedin.normalized+json+2.1",
             "Accept-Encoding": "gzip, deflate, br, zstd",
             "Accept-Language": "en-US,en;q=0.9",
@@ -53,21 +66,49 @@ class LinkedInJobRetriever:
         
     def JobDetails(self,jobId):
         try:
-            
-            resp_job_details = self.session.get(url=self.url.format(jobId), headers=self.headers)
+            resp_job_details = self.session.get(url=self.search_url.format(jobId), headers=self.session.headers)
             resp_job_details.raise_for_status()
             if resp_job_details.status_code==200:
-                resp_job_details_json = resp_job_details.json()
+                job_json = resp_job_details.json()
                 with open("job_detail.json","w") as file:
-                    json.dump(resp_job_details_json, file)
+                    json.dump(job_json, file)
+                desc = job_json["data"]["description"]["text"]
+
+                title = job_json["data"]["title"]
+                location = job_json["data"]["formattedLocation"]
+                jobApplicationUrl = job_json["data"]["jobPostingUrl"]
+                if job_json['included']:
+                    for detail in job_json['included']:
+                        if detail['$type'] == "com.linkedin.voyager.organization.Company":
+                            companyName = detail['name']
+                originallyPostedAt = convert_to_ist(job_json["data"]['originalListedAt'])
+                # print(title, companyName, desc[:80], location,originallyPostedAt,jobApplicationUrl)
+                return jobId, title, companyName, desc, location,originallyPostedAt,jobApplicationUrl
                 
         except Exception as e:
             raise SystemExit(e)
 
-    def get_job_details(job_json):
-        desc = job_json["description"]["text"]
-        title = job_json["title"]
-        location = job_json["formattedLocation"]
-        jobApplicationUrl = job_json["jobPostingUr;"]
-        return desc, title, location, jobApplicationUrl
-    
+def convert_to_ist(time):
+    utc_time = datetime.fromtimestamp(time/1000,tz=timezone.utc)
+    return utc_time.astimezone(ZoneInfo("Asia/Kolkata"))
+
+def insert_all_job_details():
+    job_ids = get_all_jobs_from_db()
+    job_retriever = LinkedInJobRetriever()
+    job_details_for_all_ids = []
+    for job_id in job_ids:
+        jobId, title, company, desc,location,posted_date, app_url = job_retriever.JobDetails(jobId=job_id)
+        job_details_for_all_ids.append((job_id, title, company, desc,location,posted_date, app_url))
+    insert_job_details(job_details_for_all_ids)
+def get_all_jobs_from_db():
+    sql_query = "SELECT job_id FROM job_processing_status where is_scraped = 0"
+    cursor.execute(sql_query)
+    job_ids_list = cursor.fetchall()
+    cleaned_list = []
+    for job_id in job_ids_list:
+        cleaned_list.append(job_id[0])
+    print(cleaned_list)
+    return cleaned_list
+insert_all_job_details()
+#job_retriever = LinkedInJobRetriever()
+#title, companyName, desc, location,originallyPostedAt,jobApplicationUrl = job_retriever.JobDetails(jobId='4378778300')
