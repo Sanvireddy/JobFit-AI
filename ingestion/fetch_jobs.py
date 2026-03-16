@@ -25,7 +25,7 @@ class LinkedInJobsSearcher:
             "Accept-Language": "en-US,en;q=0.9",
             "Referer": "https://www.linkedin.com/preload/"
         }
-        self.search_url = "https://www.linkedin.com/voyager/api/voyagerJobsDashJobCards?decorationId=com.linkedin.voyager.dash.deco.jobs.search.JobSearchCardsCollection-220&count=100&q=jobSearch&query=(origin:JOB_SEARCH_PAGE_JOB_FILTER,keywords:data%20scientist,locationUnion:(geoId:102713980),selectedFilters:(experience:List(2,3)),spellCorrectionEnabled:true)&start=0"
+        self.search_url = "https://www.linkedin.com/voyager/api/voyagerJobsDashJobCards?decorationId=com.linkedin.voyager.dash.deco.jobs.search.JobSearchCardsCollection-220&count=100&q=jobSearch&query=(origin:JOB_SEARCH_PAGE_JOB_FILTER,keywords:data%20scientist,locationUnion:(geoId:102713980),selectedFilters:(experience:List(2,3),jobType:List(F),populatedPlace:List(105214831,105556991),verifiedJob:List(true)),spellCorrectionEnabled:true)&start=200"
         
     def fetch_jobs(self):
         try:
@@ -47,7 +47,8 @@ class LinkedInJobsSearcher:
                 insert_all_fetched_job_ids(job_id_list)
         except Exception as e:
             raise SystemExit(e)
-
+# searcher = LinkedInJobsSearcher()
+# searcher.fetch_jobs()
 class LinkedInJobRetriever:
     def __init__(self):
         self.session = requests.Session()
@@ -76,9 +77,16 @@ class LinkedInJobRetriever:
 
                 title = job_json["data"]["title"]
                 location = job_json["data"]["formattedLocation"]
-                jobApplicationUrl = job_json["data"]["jobPostingUrl"]
-                if job_json['included']:
+                jobApplicationUrl = ''
+                if 'companyApplyUrl' in job_json["data"]["applyMethod"]:
+                    jobApplicationUrl = job_json["data"]["applyMethod"]["companyApplyUrl"]
+                elif 'easyApplyUrl' in job_json["data"]["applyMethod"]:
+                    jobApplicationUrl = job_json["data"]["applyMethod"]["easyApplyUrl"]
+                if 'companyName' in job_json['data']['companyDetails']:
+                    companyName = job_json['data']['companyDetails']['companyName']
+                elif job_json['included']:
                     for detail in job_json['included']:
+                        
                         if detail['$type'] == "com.linkedin.voyager.organization.Company":
                             companyName = detail['name']
                 originallyPostedAt = convert_to_ist(job_json["data"]['originalListedAt'])
@@ -100,6 +108,7 @@ def insert_all_job_details():
         jobId, title, company, desc,location,posted_date, app_url = job_retriever.JobDetails(jobId=job_id)
         job_details_for_all_ids.append((job_id, title, company, desc,location,posted_date, app_url))
     insert_job_details(job_details_for_all_ids)
+
 def get_all_jobs_from_db():
     sql_query = "SELECT job_id FROM job_processing_status where is_scraped = 0"
     cursor.execute(sql_query)
@@ -107,8 +116,7 @@ def get_all_jobs_from_db():
     cleaned_list = []
     for job_id in job_ids_list:
         cleaned_list.append(job_id[0])
-    print(cleaned_list)
+
     return cleaned_list
+
 insert_all_job_details()
-#job_retriever = LinkedInJobRetriever()
-#title, companyName, desc, location,originallyPostedAt,jobApplicationUrl = job_retriever.JobDetails(jobId='4378778300')

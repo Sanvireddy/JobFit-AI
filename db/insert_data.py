@@ -43,4 +43,15 @@ def insert_job_details(job_details):
     conn.commit()
     cursor.executemany(sql_for_insertion, job_details)
     conn.commit()
+    job_ids = [job_detail[0] for job_detail in job_details]
+    update_query = f"UPDATE job_processing_status SET is_scraped=1 WHERE job_id IN ({','.join(['?']*len(job_ids))})"
+    cursor.execute(update_query,job_ids)
+    conn.commit()
+    delete_job_details()
+    conn.close()
+
+def delete_job_details():
+    query = "DELETE FROM scraped_jobs where LOWER(title) LIKE '%intern%' OR LOWER(title) LIKE '%part%'"
+    cursor.execute(query)
+    conn.commit()
     conn.close()
