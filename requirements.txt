@@ -4,3 +4,9 @@ pandas
 pytz
 spacy
 rapidfuzz
+pycountry
+geotext
+langdetect
+deep_translator
+pydantic
+ollama
