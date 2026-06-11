@@ -12,8 +12,17 @@ def build_prompt(job_description):
 build_prompt("Hey")
 
 def extract_metadata(job_description, MAX_RETRIES=3):
+    last_error = None
     for attempt in range(MAX_RETRIES):
         prompt = build_prompt(job_description)
+        if last_error:
+            prompt += (
+                f"\n\n## PREVIOUS ATTEMPT FAILED\n"
+                f"Your previous response failed Pydantic validation with this error:\n"
+                f"{last_error}\n"
+                f"Return corrected JSON that fixes this specific issue. "
+                f"Do NOT repeat the same mistake."
+            )
         response = ollama.chat(model="qwen2.5:7b", messages=[{"role": "user", "content": prompt}])
         content = response['message']['content']
         content = content.replace("```json", "")
@@ -27,7 +36,7 @@ def extract_metadata(job_description, MAX_RETRIES=3):
             )
             return validated_output
         except Exception as e:
-
+            last_error = str(e)
             print(
                 f"Attempt {attempt + 1} failed: {e}"
             )
