@@ -163,7 +163,7 @@ def filter_jobs_by_metadata(
         
         # Check education requirement
         job_requires_advanced = metadata.get("requires_advanced_degree", False)
-        if not job_requires_advanced:
+        if job_requires_advanced:
             continue
         
         # Check language requirements
