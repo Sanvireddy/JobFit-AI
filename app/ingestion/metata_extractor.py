@@ -9,7 +9,7 @@ def build_prompt(job_description):
     prompt_template = prompt_template.replace("{output_json}", json.dumps(json_schema, indent=2))
     prompt = prompt_template.replace("{job_description}", job_description)
     return prompt
-build_prompt("Hey")
+
 
 def extract_metadata(job_description, MAX_RETRIES=3):
     last_error = None

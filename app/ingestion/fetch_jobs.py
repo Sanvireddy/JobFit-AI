@@ -79,6 +79,9 @@ class LinkedInJobRetriever:
                     jobApplicationUrl = job_json["data"]["applyMethod"]["companyApplyUrl"]
                 elif 'easyApplyUrl' in job_json["data"]["applyMethod"]:
                     jobApplicationUrl = job_json["data"]["applyMethod"]["easyApplyUrl"]
+                # Default so companyName is always bound even when neither the
+                # companyDetails nor the included[] Company entry is present.
+                companyName = None
                 if 'companyName' in job_json['data']['companyDetails']:
                     companyName = job_json['data']['companyDetails']['companyName']
                 elif job_json['included']:
@@ -130,4 +133,7 @@ def get_all_jobs_from_db():
         cleaned_list.append(job_id[0])
 
     return cleaned_list
-insert_all_job_details()
+
+
+if __name__ == "__main__":
+    insert_all_job_details()
