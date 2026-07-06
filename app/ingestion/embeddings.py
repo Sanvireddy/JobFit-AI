@@ -138,17 +138,29 @@ def get_job_metadata_by_job_ids(job_ids: List[str]) -> Dict[str, Dict]:
 def filter_jobs_by_metadata(
     jobs: List[Dict],
     job_metadata_map: Dict[str, Dict],
-    job_min_experience_years_required: Optional[int] = None,
+    candidate_experience_years: Optional[int] = None,
 ) -> List[Dict]:
-    """Filter jobs based on resume and job metadata compatibility."""
-    
+    """Keep only jobs the candidate is plausibly compatible with.
+
+    A job is kept when all of the following hold:
+    - Its required minimum experience is <= the candidate's experience. Jobs
+      demanding MORE experience than the candidate has are dropped. (When
+      ``candidate_experience_years`` is None, the experience check is skipped.)
+    - It does not explicitly require an advanced degree (Master's/PhD).
+    - It does not explicitly require a non-English language. Jobs whose
+      language requirement is unknown (``requires_only_english`` is None) are
+      kept rather than excluded, since "unknown" should not silently filter
+      out otherwise-relevant matches.
+    """
+
     filtered_jobs = []
-    
+
     for job in jobs:
         job_id = job.get("job_id")
         metadata = job_metadata_map.get(job_id, {})
-        
-        # Check experience requirement (be defensive about None / types)
+
+        # Experience: drop jobs requiring more years than the candidate has.
+        # Be defensive about None / non-numeric values in the DB.
         raw_exp = metadata.get("min_experience_years")
         try:
             job_min_experience_years = int(raw_exp) if raw_exp is not None else 0
@@ -156,40 +168,45 @@ def filter_jobs_by_metadata(
             job_min_experience_years = 0
 
         if (
-            job_min_experience_years_required is not None
-            and job_min_experience_years < job_min_experience_years_required
+            candidate_experience_years is not None
+            and job_min_experience_years > candidate_experience_years
         ):
             continue
-        
-        # Check education requirement
-        job_requires_advanced = metadata.get("requires_advanced_degree", False)
-        if job_requires_advanced:
+
+        # Education: drop jobs that explicitly require a Master's/PhD.
+        if metadata.get("requires_advanced_degree"):
             continue
-        
-        # Check language requirements
-        job_english_only = metadata.get("requires_only_english", False)
-        if not job_english_only:
+
+        # Language: drop only jobs that explicitly require a non-English
+        # language (requires_only_english is explicitly False). Keep jobs that
+        # are English-only (True) or have an unknown requirement (None).
+        if metadata.get("requires_only_english") is False:
             continue
-        
+
         filtered_jobs.append(job)
-    
+
     return filtered_jobs
 
 
 def find_matching_jobs_for_resume(
     resume_text: str,
     top_k: int = 10,
-    apply_metadata_filtering: bool = True
+    apply_metadata_filtering: bool = True,
+    candidate_experience_years: Optional[int] = 3,
 ) -> Dict:
     """
-    Complete pipeline: Resume → Metadata Extraction → Filtering → 
+    Complete pipeline: Resume → Metadata Extraction → Filtering →
     Embedding → FAISS Search → Top Matching Jobs
-    
+
     Args:
         resume_text: The resume content as text
         top_k: Number of top matching jobs to return
         apply_metadata_filtering: Whether to filter jobs by metadata compatibility
-    
+        candidate_experience_years: Years of experience the candidate has; jobs
+            requiring more than this are filtered out. Pass None to skip the
+            experience check. (TODO: derive this from the resume instead of a
+            fixed default.)
+
     Returns:
         Dictionary containing matching jobs and metadata
     """
@@ -225,7 +242,9 @@ def find_matching_jobs_for_resume(
         if apply_metadata_filtering:
             print("Step 4: Filtering jobs by metadata compatibility...")
             job_metadata_map = get_job_metadata_by_job_ids(job_ids)
-            jobs = filter_jobs_by_metadata(jobs, job_metadata_map, 3)
+            jobs = filter_jobs_by_metadata(
+                jobs, job_metadata_map, candidate_experience_years
+            )
         
         # Return top-k after filtering
         result["similar_jobs"] = jobs[:top_k]
