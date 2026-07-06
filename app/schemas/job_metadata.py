@@ -16,10 +16,16 @@ class LanguageRequirement(BaseModel):
     requirement: Literal[
         "required",
         "good_to_have",
-        "not_required"
+        "not_required",
+        "mentioned"
     ] = Field(
         default="required",
-        description="Indicates whether the language is mandatory, optional, or explicitly not required."
+        description=(
+            "Indicates whether the language is mandatory ('required'), optional/preferred "
+            "('good_to_have'), explicitly not required ('not_required'), or simply referenced "
+            "without being a requirement ('mentioned'). The extraction prompt instructs the "
+            "model to emit 'mentioned', so it must be an accepted value here."
+        )
     )
 
     evidence: str = Field(

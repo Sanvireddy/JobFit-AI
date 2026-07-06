@@ -1,1 +1,21 @@
+# Secrets / credentials
 logins.csv
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# OS / editor junk
+.DS_Store
+.antigravitycli/
+
+# Scraped data & generated artifacts (should not be versioned)
+jobs.db
+jobs.json
+job_detail.json
+*.index
+app/finetuning/*.jsonl
+outputs/

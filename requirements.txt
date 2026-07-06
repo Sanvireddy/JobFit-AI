@@ -10,3 +10,6 @@ langdetect
 deep_translator
 pydantic
 ollama
+numpy
+faiss-cpu
+sentence-transformers

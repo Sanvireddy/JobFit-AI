@@ -64,7 +64,5 @@ def get_required_skills():
             allmatches.append()
         if len(allmatches)==0: print(job_id)
         
-def normalise(description):
-    description = description.lower()
-    text = re.sub(r'[]')
-get_required_skills()
+if __name__ == "__main__":
+    get_required_skills()

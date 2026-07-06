@@ -207,7 +207,9 @@ def process_all_job_ids():
 
     print(f"Finished processing all job IDs. Total processed: {processed_count}.")
 
-process_all_job_ids()
+
+if __name__ == "__main__":
+    process_all_job_ids()
 
 # def extract_english_required_field(languages):
 #   for language in languages:

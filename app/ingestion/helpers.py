@@ -1,3 +1,4 @@
+import os
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 import time
@@ -8,7 +9,23 @@ from zoneinfo import ZoneInfo
 import pycountry
 from geotext import GeoText
 
+# Built once at import time instead of rebuilding the full pycountry set on every
+# get_country_name() call.
+_COUNTRY_NAMES = frozenset(country.name for country in pycountry.countries)
+
+
 def get_username_password():
+    """Return (email, password) for LinkedIn login.
+
+    Prefers the LINKEDIN_EMAIL / LINKEDIN_PASSWORD environment variables so that
+    credentials never need to live in a tracked file. Falls back to the legacy
+    logins.csv for backward compatibility with existing local setups.
+    """
+    env_email = os.environ.get("LINKEDIN_EMAIL")
+    env_password = os.environ.get("LINKEDIN_PASSWORD")
+    if env_email and env_password:
+        return env_email, env_password
+
     df = pd.read_csv("logins.csv")
     emails = df['emails']
     passwords = df['passwords']
@@ -46,9 +63,8 @@ def convert_to_ist(time):
     return utc_time.astimezone(ZoneInfo("Asia/Kolkata"))
 
 def get_country_name(location):
-    countries = set(country.name for country in pycountry.countries)
     places = GeoText(text=location)
-    extracted_countries = [c for c in places.countries if c in countries]
+    extracted_countries = [c for c in places.countries if c in _COUNTRY_NAMES]
     return ' '.join(extracted_countries)
 
 def compute_is_only_english_required(
