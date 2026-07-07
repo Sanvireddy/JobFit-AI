@@ -31,6 +31,11 @@ LinkedIn (Voyager API)
         START
           │
           ▼
+     ┌────────┐
+     │ intake │   (--interactive only: interrupt() asks for skills,
+     └───┬────┘    locations, relocation, visa — feeds the filter)
+          │
+          ▼
      ┌─────────┐   error   ┌─────┐
      │find_jobs├──────────►│ END │
      └────┬────┘           └─────┘
@@ -41,18 +46,23 @@ LinkedIn (Voyager API)
  └────────┬─────────┘
           │
           ▼
-     ┌─────────┐  tool calls   ┌───────┐
-     │  agent  ├──────────────►│ tools │   tailor_resume
-     │ (Groq)  │◄──────────────┤       │   write_cover_letter
-     └────┬────┘               └───────┘   mark_applied
-          │ no tool calls
-          ▼
-         END
+     ┌─────────┐  tool calls   ┌───────┐   investigate: analyze_fit,
+     │  agent  ├──────────────►│ tools │     get_job_description,
+     │ (Groq)  │◄──────────────┤       │     check_job_active, research_company
+     └────┬────┘               └───────┘   prepare: tailor_resume,
+          │ no tool calls                    write_cover_letter
+          ▼                                  (draft → LLM review → revise)
+ ┌──────────────┐
+ │ human_review │   interrupt(): approve/skip each prepared application
+ └──────┬───────┘
+         ▼
+        END
 ```
 
 - `find_jobs` / `extract_metadata` are **deterministic nodes**: embed the resume, search FAISS, apply compatibility filters, enrich with structured requirements. A conditional edge routes to END if matching fails (`state["error"]`).
-- The **agent node** sees the enriched shortlist and loops with a `ToolNode` until it stops emitting tool calls. Tools receive graph state via `InjectedState` and write results back through `Command` updates — the LLM only ever supplies a `job_id`.
-- `mark_applied` only updates tracking state; nothing is ever submitted externally without a human in the loop.
+- The **agent node** sees the enriched shortlist and loops with a `ToolNode` until it stops emitting tool calls. It works in two phases: *investigate* (a deterministic `analyze_fit` report per job, the full description on demand, an optional LinkedIn liveness check, and company research to ground cover letters), then *prepare*. Tools receive graph state via `InjectedState` and write results back through `Command` updates — the LLM only ever supplies a `job_id`.
+- The **generation tools run an evaluator-optimizer loop**: every draft is judged by a structured-output LLM reviewer for truthfulness against the original resume and regenerated with the critique when rejected (the same retry-with-feedback idea as the extraction layer, applied to open-ended generation).
+- **Applying is not a tool.** Prepared materials stop at the `human_review` interrupt; a person approves or skips each job, and only then are statuses set and artifacts saved. The model cannot mark anything applied.
 
 ## Project structure
 
@@ -125,15 +135,20 @@ python -m app.ingestion.build_index
 ```bash
 export GROQ_API_KEY=gsk_...
 python -m app.agent.run path/to/resume.txt --top-k 5 --experience-years 3
+
+# Ask for preferences (must-have skills, locations, visa) before matching:
+python -m app.agent.run path/to/resume.txt --interactive
 ```
 
-The agent prints a summary of which jobs it prepared (and why) and writes tailored resumes and cover letters to `outputs/<job_id>/`.
+The run pauses twice for input when there is something to decide: at intake (with `--interactive`) and at the approval gate whenever materials were prepared. The agent prints a summary of which jobs it prepared or skipped (and why), then writes tailored resumes and cover letters for the **approved** jobs to `outputs/<job_id>/` along with a per-job status report.
 
 ## Design decisions
 
-- **Deterministic spine, agentic head.** Matching and enrichment are plain graph nodes with explicit conditional edges; the LLM loop only starts once there is a concrete, typed shortlist to reason over. Agents should decide things that need judgment — not run ETL.
-- **Typed state everywhere.** `AgentState` is a TypedDict whose fields are Pydantic domain models (`CandidateProfile`, `JobMatch`, `TailoredArtifacts`, `ApplicationRecord`). Only `messages` uses an appending reducer; every other field is overwritten wholesale by the node that owns it.
-- **Tools write state via `Command`, not prose.** Action tools receive `InjectedState`, look up the job by id, and return a `Command` that updates typed fields (`artifacts`, `applications`) plus a `ToolMessage`. Results are never smuggled through free-text messages.
+- **Deterministic spine, agentic head.** Matching and enrichment are plain graph nodes with explicit conditional edges; the LLM loop only starts once there is a concrete, typed shortlist to reason over. Agents should decide things that need judgment — not run ETL. Even inside the loop, `analyze_fit` is deterministic: it reports facts, and the model supplies the judgment.
+- **Typed state everywhere, merged by reducers.** `AgentState` is a TypedDict whose fields are Pydantic domain models (`CandidateProfile`, `JobMatch`, `TailoredArtifacts`, `ApplicationRecord`). `messages` appends; `artifacts` and `applications` merge per job (field-wise for artifacts), so the parallel tool calls the model routinely emits in one turn can never clobber each other. `matches` is overwritten wholesale by the node that owns it.
+- **Tools write state via `Command`, not prose.** Action tools receive `InjectedState`, look up the job by id, and return a `Command` with per-job *deltas* to typed fields (`artifacts`, `applications`) plus a `ToolMessage`. Results are never smuggled through free-text messages.
+- **Generation is reviewed, not trusted.** Tailored resumes and cover letters pass an LLM-as-judge truthfulness check (structured output) and are revised with the critique when rejected; the tool result tells the agent whether the final draft passed.
+- **Humans gate side effects.** LangGraph `interrupt()` + a checkpointer pause the run for profile intake and for per-job approval of prepared applications. "Applied" is a status only a human decision can set.
 - **Dependency-injected model.** `build_graph(model=...)` accepts any chat model, so the whole graph is testable with a fake — no API key needed (see `tests/test_agent_graph.py`).
 - **Schema-validated extraction with error feedback.** The extraction prompt embeds the Pydantic JSON schema; invalid responses are retried with the specific validation error appended, which fixes most malformed outputs within a retry or two.
 - **Metadata is extracted once, then reused.** Batch extraction persists requirements to SQLite; at query time the matcher rehydrates them, and the agent's enrichment node only calls the LLM for jobs with gaps.
@@ -145,7 +160,7 @@ The agent prints a summary of which jobs it prepared (and why) and writes tailor
 python -m pytest tests/
 ```
 
-The suite covers the metadata compatibility filters, metadata rehydration from DB rows, prompt rendering, and full graph wiring (happy path, error routing, enrichment skipping) using an injected fake model — no network, database, or API keys required.
+The suite covers the metadata compatibility filters (including skills / location / visa preferences), metadata rehydration from DB rows, prompt rendering, the fit-report tool, the critique-and-revise loop (revision on rejection, giving up after max rounds), reducer merging under parallel tool calls, and full graph wiring — happy path, error routing, enrichment skipping, and both interrupts (intake and approval) resumed via `Command(resume=...)` — using an injected fake model. No network, database, or API keys required.
 
 ## Extraction accuracy evaluation
 
@@ -162,7 +177,7 @@ To validate the LLM-based metadata extraction layer, 50 job postings were manual
 
 ## Limitations & future work
 
-- **Human-in-the-loop approval** via LangGraph `interrupt` before `mark_applied`, plus a checkpointer for resumable multi-turn sessions.
+- **Persistent sessions**: swap the in-memory checkpointer for `SqliteSaver` so an interrupted run (or a crash mid-loop) can resume across processes, and persist `applications` so past decisions inform future runs.
 - **Two-tower retrieval**: separate resume/job encoders trained on application feedback, replacing the single off-the-shelf embedding model.
 - **Re-ranking** with explainable signals (skill overlap, recency, seniority match) on top of cosine similarity.
 - **Resume parsing** to derive `experience_years` and skills from the resume instead of CLI flags.
