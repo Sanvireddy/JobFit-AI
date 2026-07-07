@@ -1,236 +1,155 @@
 # JobFit-AI
 
-JobFit-AI is a personal prototype for intelligent job matching. It scrapes LinkedIn job postings, extracts structured metadata with a local LLM, builds semantic embeddings for job descriptions, and ranks the best job matches for a resume using vector search and metadata filtering.
+JobFit-AI is an end-to-end job-application system: it scrapes LinkedIn job postings, extracts structured requirements with a local LLM, matches jobs to a resume with semantic vector search, and then hands the shortlist to a **LangGraph agent** that decides which jobs are worth pursuing and prepares tailored application materials for each one.
 
-## Problem Statement
+The project is built in two layers with deliberately different designs:
 
-This project aims to automate job discovery by combining:
+- **A deterministic data pipeline** (scrape → extract → index) — batch jobs where control flow should be explicit and repeatable, so no LLM decides anything.
+- **An agentic layer** (LangGraph) — where judgment is actually needed: *which* of the matched jobs to pursue, and what tailored materials to produce. The LLM makes those calls through typed tools; everything it does is written back into typed graph state.
 
-- job description ingestion from LinkedIn,
-- feature extraction and metadata enrichment with a language model,
-- semantic resume-to-job similarity search using embeddings,
-- domain-aware filtering based on experience, language, and educational requirements.
+## Architecture
 
-## Project Overview
+### Offline ingestion pipeline (run periodically)
 
-JobFit-AI is organized as a data pipeline rather than a user-facing web app. The main components are:
+```
+LinkedIn (Voyager API)
+      │  app/ingestion/fetch_jobs.py
+      ▼
+  SQLite (scraped_jobs)
+      │
+      ├── app/ingestion/extract_metadata_batch.py
+      │      └─ Ollama (qwen2.5:7b) → validated JobMetadata → job_metadata table
+      │
+      └── app/ingestion/build_index.py
+             └─ sentence-transformers (all-MiniLM-L6-v2) → FAISS index
+                (vector position stored back on each scraped_jobs row)
+```
 
-- LinkedIn job ingestion and scraping
-- LLM-based job metadata extraction
-- Embedding generation and FAISS vector indexing
-- Resume embedding and nearest-neighbor search
-- Metadata filtering and match ranking
-- Export/evaluation utilities for processed data
+### Agent graph (run per resume)
 
-## Architecture Explanation
+```
+        START
+          │
+          ▼
+     ┌─────────┐   error   ┌─────┐
+     │find_jobs├──────────►│ END │
+     └────┬────┘           └─────┘
+          │ matches
+          ▼
+ ┌──────────────────┐
+ │ extract_metadata │   (fills gaps only — persisted metadata rides along)
+ └────────┬─────────┘
+          │
+          ▼
+     ┌─────────┐  tool calls   ┌───────┐
+     │  agent  ├──────────────►│ tools │   tailor_resume
+     │ (Groq)  │◄──────────────┤       │   write_cover_letter
+     └────┬────┘               └───────┘   mark_applied
+          │ no tool calls
+          ▼
+         END
+```
 
-The repository follows a modular pipeline:
+- `find_jobs` / `extract_metadata` are **deterministic nodes**: embed the resume, search FAISS, apply compatibility filters, enrich with structured requirements. A conditional edge routes to END if matching fails (`state["error"]`).
+- The **agent node** sees the enriched shortlist and loops with a `ToolNode` until it stops emitting tool calls. Tools receive graph state via `InjectedState` and write results back through `Command` updates — the LLM only ever supplies a `job_id`.
+- `mark_applied` only updates tracking state; nothing is ever submitted externally without a human in the loop.
 
-1. **Job ingestion:** Grab job IDs and descriptions from LinkedIn, then save them in a local SQLite database.
-2. **Metadata extraction:** Use an LLM prompt to convert each job description into structured fields such as experience, language requirements, education requirement, and relocation policy.
-3. **Embedding pipeline:** Encode job descriptions using `sentence-transformers` and store the vectors in a FAISS index.
-4. **Semantic search:** Encode a resume, query the FAISS index for nearest jobs, and then retrieve job details from SQLite.
-5. **Filtering and ranking:** Apply metadata-based filters and return the top matching jobs.
+## Project structure
 
-### Data Flow
+```
+app/
+├── config.py                  # paths + model names (env-overridable), single source of truth
+├── schemas/
+│   └── job_metadata.py        # Pydantic schema the extraction LLM must satisfy
+├── db/
+│   └── repository.py          # all SQLite access; schema defined once in init_db()
+├── embeddings/
+│   ├── encoder.py             # lazy-loaded sentence-transformers model
+│   └── index_store.py         # FAISS index load/save
+├── ingestion/                 # offline batch jobs
+│   ├── fetch_jobs.py          # LinkedIn scraping (ids + full details)
+│   ├── metadata_extractor.py  # Ollama extraction w/ validation-feedback retries
+│   ├── extract_metadata_batch.py
+│   ├── build_index.py         # embed new jobs into FAISS
+│   └── helpers.py             # auth, text cleaning, derived fields
+├── matching/
+│   └── matcher.py             # query-time: embed resume → search → filter → rank
+├── agent/                     # LangGraph agentic layer
+│   ├── state.py               # domain schemas + AgentState (TypedDict w/ reducers)
+│   ├── prompts.py             # all prompt text in one place
+│   ├── tools.py               # pipeline functions + LLM-callable action tools
+│   ├── nodes.py               # thin state-marshalling adapters over tools
+│   ├── llm.py                 # Groq chat-model factory (dependency-injected)
+│   ├── graph.py               # graph wiring only
+│   └── run.py                 # CLI entrypoint
+└── llm/prompts/               # extraction prompt template
+tests/                         # pure-logic + graph-wiring tests (no keys/network needed)
+```
 
-- `app/ingestion/fetch_jobs.py`: Scrapes raw jobs from LinkedIn and stores job IDs/details.
-- `app/db/insert_data.py`: Writes scraped job details and metadata into `jobs.db`.
-- `app/ingestion/metata_extractor.py`: Calls Ollama to parse text into the `JobMetadata` schema.
-- `app/ingestion/embeddings.py`: Creates and queries a FAISS index saved as `job_desc.index`.
-- `app/services/extract_features.py`: Orchestrates resume matching and filtering.
+## Setup
 
-### Embedding Pipeline
-
-The embedding pipeline converts job description text into numeric vectors:
-
-- Model: `sentence-transformers/all-MiniLM-L6-v2`
-- Library: `sentence-transformers`, `faiss`
-- Storage: FAISS index plus SQLite mapping from job IDs to index positions.
-
-### Semantic Search & Vector Similarity
-
-Semantic search finds jobs whose meaning is similar to a resume rather than simply matching keywords. It works by:
-
-- transforming text into dense vectors (embeddings)
-- comparing vectors using cosine similarity or inner product
-- returning the nearest vectors in vector space
-
-This is much more flexible than keyword search for job matching.
-
-### Recommendation Logic
-
-Matching logic combines two signals:
-
-- semantic similarity from the FAISS vector search,
-- job metadata compatibility from the extracted fields.
-
-Example filters include minimum experience, English-only requirements, and advanced degree flags.
-
-
-## Folder Structure
-
-- `app/ingestion/`
-  - `fetch_jobs.py`: LinkedIn scrapers for job search and job detail retrieval.
-  - `helpers.py`: utilities for cleaning text, timezone conversion, cookies, and language checks.
-  - `embeddings.py`: FAISS index creation, query, and resume matching.
-  - `metata_extractor.py`: LLM-based structured metadata extraction.
-- `app/db/`
-  - `insert_data.py`: SQLite database creation and CRUD operations.
-- `app/schemas/`
-  - `job_metadata.py`: Pydantic schema for structured job metadata.
-- `app/services/`
-  - `extract_features.py`: Resume matching pipeline and result display.
-- `app/ranking/`
-  - `skills-extractor.py`: experimental skill and experience extraction utilities.
-- `jobs.db`: local SQLite database generated by the pipeline.
-- `job_desc.index`: FAISS index file generated by the embedding pipeline.
-
-## Setup Instructions
-
-### Prerequisites
-
-- Python 3.10+ or compatible
-- `pip` or `pipenv`
-- Local Ollama installation with `qwen2.5:7b` model available
-- Google Chrome and ChromeDriver for Selenium
-- `jobs.db` will be created automatically on first run
-
-### Recommended Python packages
-
-Install dependencies with:
+Prerequisites: Python 3.10+, Chrome + ChromeDriver (scraping), [Ollama](https://ollama.com/) with `qwen2.5:7b` pulled (metadata extraction), and a [Groq](https://groq.com/) API key (agent).
 
 ```bash
-pip install -r requirements.txt
-pip install faiss-cpu sentence-transformers
+python -m venv venv && source venv/bin/activate
+pip install -r requirements.txt        # add -r requirements-dev.txt for tests
 ```
 
-If you use a GPU-enabled environment, install the appropriate FAISS package instead.
+Configuration is environment-driven (see `app/config.py`):
 
-### Additional tools
+| Variable | Purpose | Default |
+|---|---|---|
+| `GROQ_API_KEY` | Agent reasoning model (required for the agent) | — |
+| `GROQ_MODEL` | Override the Groq model | `llama-3.3-70b-versatile` |
+| `OLLAMA_MODEL` | Local extraction model | `qwen2.5:7b` |
+| `EMBEDDING_MODEL` | sentence-transformers model | `all-MiniLM-L6-v2` |
+| `LINKEDIN_EMAIL` / `LINKEDIN_PASSWORD` | Scraper login | falls back to gitignored `logins.csv` |
 
-- Install [Ollama](https://ollama.com/) and `ollama` Python package.
-- Ensure `qwen2.5:7b` is downloaded and available in Ollama.
-- Place LinkedIn credentials in `logins.csv` with columns `emails,passwords`.
+## Running the pipeline
 
-## Environment Variables and Configuration
-
-This project currently uses local files and SQLite. The key configuration points are:
-
-- `logins.csv`: LinkedIn login credentials for Selenium
-- `jobs.db`: SQLite database storage
-- `job_desc.index`: FAISS vector index file
-- Ollama local model: `qwen2.5:7b`
-
-> Note: Do not commit credentials or private API keys to source control.
-
-## How to Run Locally
-
-### 1. Step 1 — Fetch raw job IDs from LinkedIn
+Each stage is an idempotent batch job — re-running only processes what is new or previously failed:
 
 ```bash
-python app/ingestion/fetch_jobs.py
+# 1. Discover job ids and fetch full details into SQLite
+python -m app.ingestion.fetch_jobs
+
+# 2. Extract structured requirements for unprocessed jobs (Ollama)
+python -m app.ingestion.extract_metadata_batch
+
+# 3. Embed new job descriptions into the FAISS index
+python -m app.ingestion.build_index
 ```
 
-This script uses Selenium to log into LinkedIn and gather raw job IDs.
-
-### 2. Step 2 — Fetch full job details
+## Running the agent
 
 ```bash
-python app/ingestion/fetch_jobs.py
+export GROQ_API_KEY=gsk_...
+python -m app.agent.run path/to/resume.txt --top-k 5 --experience-years 3
 ```
 
-The same module also contains logic to fetch each job's title, company, description, location, and URL.
+The agent prints a summary of which jobs it prepared (and why) and writes tailored resumes and cover letters to `outputs/<job_id>/`.
 
-### 3. Step 3 — Extract metadata from job descriptions
+## Design decisions
 
-There is no direct CLI wrapper in this module yet. Run the extraction logic from Python:
+- **Deterministic spine, agentic head.** Matching and enrichment are plain graph nodes with explicit conditional edges; the LLM loop only starts once there is a concrete, typed shortlist to reason over. Agents should decide things that need judgment — not run ETL.
+- **Typed state everywhere.** `AgentState` is a TypedDict whose fields are Pydantic domain models (`CandidateProfile`, `JobMatch`, `TailoredArtifacts`, `ApplicationRecord`). Only `messages` uses an appending reducer; every other field is overwritten wholesale by the node that owns it.
+- **Tools write state via `Command`, not prose.** Action tools receive `InjectedState`, look up the job by id, and return a `Command` that updates typed fields (`artifacts`, `applications`) plus a `ToolMessage`. Results are never smuggled through free-text messages.
+- **Dependency-injected model.** `build_graph(model=...)` accepts any chat model, so the whole graph is testable with a fake — no API key needed (see `tests/test_agent_graph.py`).
+- **Schema-validated extraction with error feedback.** The extraction prompt embeds the Pydantic JSON schema; invalid responses are retried with the specific validation error appended, which fixes most malformed outputs within a retry or two.
+- **Metadata is extracted once, then reused.** Batch extraction persists requirements to SQLite; at query time the matcher rehydrates them, and the agent's enrichment node only calls the LLM for jobs with gaps.
+- **Failures are data, not crashes.** Node failures land in `state["error"]` and route through a conditional edge; per-job failures in batch jobs are collected and reported, leaving the job eligible for retry on the next run.
+
+## Testing
 
 ```bash
-python -c "from app.services.extract_features import process_all_job_ids; process_all_job_ids()"
+python -m pytest tests/
 ```
 
-This step calls the local Ollama model to extract structured metadata for each job.
+The suite covers the metadata compatibility filters, metadata rehydration from DB rows, prompt rendering, and full graph wiring (happy path, error routing, enrichment skipping) using an injected fake model — no network, database, or API keys required.
 
-### 4. Step 4 — Build job description embeddings and FAISS index
+## Extraction accuracy evaluation
 
-```bash
-python -c "from app.ingestion.embeddings import store_embeddings; store_embeddings()"
-```
-
-This creates `job_desc.index` and stores job vectors.
-
-### 5. Step 5 — Match a resume against jobs
-
-Use the `find_matching_jobs_for_resume` helper in `app/services/extract_features.py` directly from Python, or adapt it into a small driver script.
-
-
-## Example Usage
-
-Load Python and run the resume matching pipeline:
-
-```python
-from app.services.extract_features import find_matching_jobs_for_resume
-
-resume_text = open('resume.txt', 'r', encoding='utf-8').read()
-result = find_matching_jobs_for_resume(resume_text, top_k=10)
-print(result)
-```
-
-This will return the top matching jobs along with FAISS similarity scores and filtered metadata.
-
-## API Usage
-
-There is no production API or UI implemented yet. The current interface is script-based and Python-driven.
-
-## Technologies Used
-
-- Python 3
-- SQLite for local storage
-- Selenium for LinkedIn login and scraping
-- Ollama for local LLM inference
-- Pydantic for schema validation
-- FAISS for vector similarity search
-- sentence-transformers for generating embeddings
-- pycountry, GeoText, langdetect for language and location utilities
-- pandas for CSV/helper utilities
-
-## Design Decisions
-
-- **Local SQLite + FAISS**: lightweight and simple for prototyping.
-- **LLM metadata extraction**: uses a schema-driven prompt to structure unstructured job descriptions.
-- **Semantic job matching**: searches by meaning, not just keywords.
-- **Metadata filtering**: adds domain signals such as experience and language requirements to improve relevance.
-- **Script-first architecture**: keeps the prototype easy to run and inspect without frontend complexity.
-
-## Future Improvements
-
-- Implement a proper API or UI layer with FastAPI or Streamlit.
-- Add resume parsing to extract skills, titles, and experience, not just embed raw text.
-- Support chunking for very long job descriptions and resumes.
-- Add a true Two Tower model architecture for separate resume and job encoders.
-- Expand the RAG-style retrieval step to include job descriptions plus external knowledge prompts.
-- Add more advanced ranking / re-ranking with business rules and explainable signals.
-- Add negative sampling and feedback loops for better personalization.
-
-## Challenges Faced
-
-- Scraping LinkedIn reliably requires login cookies, headers, and careful session handling.
-- Getting consistent JSON output from the LLM requires robust prompt engineering and validation.
-- Aligning vector search with structured metadata is tricky because semantic similarity alone can surface functionally similar but mismatched roles.
-
-## Extraction Accuracy Evaluation
-
-To validate the LLM-based metadata extraction layer, 50 job postings were manually labeled and compared against Ollama's extracted output across three critical filtering fields.
-
-### Methodology
-
-- **Sample size:** 50 randomly selected job postings
-- **Model:** Ollama (local LLM) with Pydantic-validated structured output
-- **Fields evaluated:** `min_experience_years`, `only_english_required`, `higher_education_req`
-- **Metric:** Per-field accuracy (correct extractions / total labeled)
-
-### Results
+To validate the LLM-based metadata extraction layer, 50 job postings were manually labeled and compared against the extracted output across the three fields used for hard filtering.
 
 | Field                   | Correct | Wrong | Accuracy |
 |-------------------------|---------|-------|----------|
@@ -239,9 +158,12 @@ To validate the LLM-based metadata extraction layer, 50 job postings were manual
 | `higher_education_req`  | 48 / 50 | 2     | 96.0%    |
 | **Overall**             | **140 / 150** | **10** | **93.3%** |
 
-### Interpretation
+`only_english_required` and `higher_education_req` are reliable enough for hard filtering. `min_experience_years` at 88% reflects genuine ambiguity in how experience is stated ("senior level", "3–5 years", "some experience preferred") — which is why unknown values are never treated as disqualifying.
 
-- `only_english_required` and `higher_education_req` at **96%** are reliable enough for hard filtering.
-- `min_experience_years` at **88%** reflects the inherent ambiguity in how experience is stated in job postings (e.g., *"senior level"*, *"3–5 years"*, *"some experience preferred"*). This field uses a confidence threshold before being applied as a filter.
-- Overall extraction accuracy of **93.3%** confirms the pipeline is production-ready for personal job screening use.
+## Limitations & future work
 
+- **Human-in-the-loop approval** via LangGraph `interrupt` before `mark_applied`, plus a checkpointer for resumable multi-turn sessions.
+- **Two-tower retrieval**: separate resume/job encoders trained on application feedback, replacing the single off-the-shelf embedding model.
+- **Re-ranking** with explainable signals (skill overlap, recency, seniority match) on top of cosine similarity.
+- **Resume parsing** to derive `experience_years` and skills from the resume instead of CLI flags.
+- Scraping depends on LinkedIn's internal API and cookies; it is best-effort and for personal use.

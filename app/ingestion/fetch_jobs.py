@@ -1,139 +1,167 @@
-import requests
-import json
-from app.ingestion.helpers import clean_job_desc, convert_to_ist, get_cookies, get_country_name  
-from app.db.insert_data import insert_all_fetched_job_ids, insert_job_details 
-import sqlite3
+"""LinkedIn scraping: discover job ids, then fetch full job details.
 
-conn = sqlite3.connect("jobs.db")
-cursor = conn.cursor()
+Two clients wrap LinkedIn's internal Voyager API, authenticated with cookies
+from a one-time Selenium login (see :mod:`app.ingestion.helpers`):
+
+- :class:`LinkedInJobsSearcher` runs a job search and stores discovered ids.
+- :class:`LinkedInJobRetriever` fetches full details for one job id.
+
+Run with:  python -m app.ingestion.fetch_jobs
+"""
+
+import logging
+
+import requests
+
+from app.db import repository
+from app.ingestion.helpers import (
+    clean_job_desc,
+    convert_to_ist,
+    get_cookies,
+    get_country_name,
+)
+
+logger = logging.getLogger(__name__)
+
+# Voyager search query: ML/AI/DS keywords, worldwide (geoId 91000000),
+# full-time, entry/associate experience levels, verified postings.
+SEARCH_URL = (
+    "https://www.linkedin.com/voyager/api/voyagerJobsDashJobCards"
+    "?decorationId=com.linkedin.voyager.dash.deco.jobs.search.JobSearchCardsCollection-220"
+    "&count=100&q=jobSearch"
+    "&query=(origin:JOB_SEARCH_PAGE_JOB_FILTER,"
+    "keywords:%28%22data%20scientist%22%20OR%20%22machine%20learning%20engineer%22%20OR%20%22AI%20engineer%22%29,"
+    "locationUnion:(geoId:91000000),"
+    "selectedFilters:(experience:List(2,3),jobType:List(F),verifiedJob:List(true)),"
+    "spellCorrectionEnabled:true)&start=500"
+)
+JOB_DETAIL_URL = (
+    "https://www.linkedin.com/voyager/api/jobs/jobPostings/{}"
+    "?decorationId=com.linkedin.voyager.deco.jobs.web.shared.WebFullJobPosting-65"
+)
+
+
+def _build_session() -> requests.Session:
+    """Create a requests session carrying LinkedIn auth cookies and headers."""
+    session = requests.Session()
+    for cookie in get_cookies():
+        session.cookies.set(cookie["name"], cookie["value"])
+    session.headers.update(
+        {
+            "User-Agent": "Mozilla/5.0",
+            "Csrf-Token": session.cookies["JSESSIONID"].strip('"'),
+            "Accept": "application/vnd.linkedin.normalized+json+2.1",
+            "Cookie": "; ".join(
+                f"{key}={value}" for key, value in session.cookies.items()
+            ),
+            "Accept-Encoding": "gzip, deflate, br, zstd",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://www.linkedin.com/preload/",
+        }
+    )
+    return session
+
 
 class LinkedInJobsSearcher:
-    def __init__(self):
-        self.session = requests.Session()
-        for cookie in get_cookies():
-            self.session.cookies.set(cookie["name"], cookie["value"])
+    """Runs the job search query and records discovered job ids."""
 
-        self.session.headers = {
-            "User-Agent": "Mozilla/5.0",
-            "Csrf-Token": self.session.cookies["JSESSIONID"].strip('"'),
-            "Accept": "application/vnd.linkedin.normalized+json+2.1",
-            "Cookie": "; ".join([f"{key}={value}" for key, value in self.session.cookies.items()]),
-            "Accept-Encoding": "gzip, deflate, br, zstd",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Referer": "https://www.linkedin.com/preload/"
-        }
-        self.search_url = "https://www.linkedin.com/voyager/api/voyagerJobsDashJobCards?decorationId=com.linkedin.voyager.dash.deco.jobs.search.JobSearchCardsCollection-220&count=100&q=jobSearch&query=(origin:JOB_SEARCH_PAGE_JOB_FILTER,keywords:%28%22data%20scientist%22%20OR%20%22machine%20learning%20engineer%22%20OR%20%22AI%20engineer%22%29,locationUnion:(geoId:91000000),selectedFilters:(experience:List(2,3),jobType:List(F),verifiedJob:List(true)),spellCorrectionEnabled:true)&start=500"
-        
-    def fetch_jobs(self):
-        try:
-            resp_jobs = self.session.get(url=self.search_url, headers=self.session.headers)
-            resp_jobs.raise_for_status()
-            if resp_jobs.status_code==200:
-                jobs = resp_jobs.json()
-                with open("jobs.json",'w') as file:
-                    json.dump(jobs, file, indent=4)
-                    
-                total_jobs_fetched = jobs['data']['paging']['total']
-                print("Total number of jobs available from URL: ", total_jobs_fetched)
-                job_id_list = []
-                for element in jobs['data']['elements']:
-                    if "JobCard" in element["$type"]:
-                        jobPostingCard = element["jobCardUnion"]["*jobPostingCard"]
-                        job_id_list.append(jobPostingCard.split("(")[1].split(',')[0])
-                     
-                insert_all_fetched_job_ids(job_id_list)
-        except Exception as e:
-            raise SystemExit(e)
+    def __init__(self, session: requests.Session | None = None):
+        self.session = session or _build_session()
+
+    def fetch_jobs(self) -> list[str]:
+        response = self.session.get(SEARCH_URL)
+        response.raise_for_status()
+        payload = response.json()
+
+        total = payload["data"]["paging"]["total"]
+        logger.info("Total jobs available for this search: %s", total)
+
+        job_ids = []
+        for element in payload["data"]["elements"]:
+            if "JobCard" in element["$type"]:
+                card_ref = element["jobCardUnion"]["*jobPostingCard"]
+                job_ids.append(card_ref.split("(")[1].split(",")[0])
+
+        repository.insert_fetched_job_ids(job_ids)
+        logger.info("Stored %d job ids", len(job_ids))
+        return job_ids
+
 
 class LinkedInJobRetriever:
-    def __init__(self):
-        self.session = requests.Session()
-        for cookie in get_cookies():
-            self.session.cookies.set(cookie["name"], cookie["value"])
-        self.session.headers = {
-            "User-Agent": "Mozilla/5.0",
-            "Cookie": "; ".join([f"{key}={value}" for key,value in self.session.cookies.items()]),
-            "Csrf-Token": self.session.cookies["JSESSIONID"].strip('"'),
-            "Accept": "application/vnd.linkedin.normalized+json+2.1",
-            "Accept-Encoding": "gzip, deflate, br, zstd",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Referer": "https://www.linkedin.com/preload/"
-        }
-        self.search_url = "https://www.linkedin.com/voyager/api/jobs/jobPostings/{}?decorationId=com.linkedin.voyager.deco.jobs.web.shared.WebFullJobPosting-65"
-        
-    def JobDetails(self,jobId):
+    """Fetches full details for individual job postings."""
+
+    def __init__(self, session: requests.Session | None = None):
+        self.session = session or _build_session()
+
+    def fetch_job_details(self, job_id: str):
+        """Return a scraped_jobs row tuple for one job, or None on failure."""
         try:
-            resp_job_details = self.session.get(url=self.search_url.format(jobId), headers=self.session.headers)
-            resp_job_details.raise_for_status()
-            if resp_job_details.status_code==200:
-                job_json = resp_job_details.json()
-                with open("job_detail.json","w") as file:
-                    json.dump(job_json, file)
-                desc = clean_job_desc(job_json["data"]["description"]["text"])
-                
-                title = job_json["data"]["title"]
-                location = job_json["data"]["formattedLocation"]
-                country = get_country_name(location)
-                jobApplicationUrl = ''
-                if 'companyApplyUrl' in job_json["data"]["applyMethod"]:
-                    jobApplicationUrl = job_json["data"]["applyMethod"]["companyApplyUrl"]
-                elif 'easyApplyUrl' in job_json["data"]["applyMethod"]:
-                    jobApplicationUrl = job_json["data"]["applyMethod"]["easyApplyUrl"]
-                # Default so companyName is always bound even when neither the
-                # companyDetails nor the included[] Company entry is present.
-                companyName = None
-                if 'companyName' in job_json['data']['companyDetails']:
-                    companyName = job_json['data']['companyDetails']['companyName']
-                elif job_json['included']:
-                    for detail in job_json['included']:
-                        
-                        if detail['$type'] == "com.linkedin.voyager.organization.Company":
-                            companyName = detail['name']
-                originallyPostedAt = convert_to_ist(job_json["data"]['originalListedAt'])
-                # print(title, companyName, desc[:80], location,originallyPostedAt,jobApplicationUrl)
-                return jobId, title, companyName, desc, location,originallyPostedAt,jobApplicationUrl, country
-                
-        except Exception as e:
-            print(f"Failed to fetch job {jobId}: {e}")
+            response = self.session.get(JOB_DETAIL_URL.format(job_id))
+            response.raise_for_status()
+            data = response.json()["data"]
+
+            description = clean_job_desc(data["description"]["text"])
+            title = data["title"]
+            location = data["formattedLocation"]
+            country = get_country_name(location)
+            posted_at = convert_to_ist(data["originalListedAt"])
+
+            apply_method = data.get("applyMethod", {})
+            application_url = apply_method.get("companyApplyUrl") or apply_method.get(
+                "easyApplyUrl", ""
+            )
+
+            company = data.get("companyDetails", {}).get("companyName")
+            if company is None:
+                # Fall back to the normalized Company entity in included[].
+                for entity in response.json().get("included", []):
+                    if entity["$type"] == "com.linkedin.voyager.organization.Company":
+                        company = entity["name"]
+                        break
+
+            return (
+                job_id,
+                title,
+                company,
+                description,
+                location,
+                posted_at,
+                application_url,
+                country,
+            )
+        except Exception as exc:
+            logger.warning("Failed to fetch job %s: %s", job_id, exc)
             return None
-    
-    def isJobExpired(self, jobId):
-        try:
-            resp_job_details = self.session.get(url=self.search_url.format(jobId), headers=self.session.headers)
-            resp_job_details.raise_for_status()
-            if resp_job_details.status_code==200:
-                job_json = resp_job_details.json()
-                with open("job_detail.json","w") as file:
-                    json.dump(job_json, file)
-                if job_json['data']['jobState'] == "CLOSED":
-                    sql_query = 'DELETE FROM scraped_jobs WHERE job_id = ?'
-                    cursor.execute(sql_query,(jobId,))
-                    conn.commit()
-        except Exception as e:
-            raise SystemExit(e)
 
-def insert_all_job_details():
-    job_ids = get_all_jobs_from_db()
-    job_retriever = LinkedInJobRetriever()
-    job_details_for_all_ids = []
+    def delete_if_expired(self, job_id: str) -> bool:
+        """Check whether a posting is closed; delete it from the DB if so."""
+        response = self.session.get(JOB_DETAIL_URL.format(job_id))
+        response.raise_for_status()
+        if response.json()["data"]["jobState"] == "CLOSED":
+            repository.delete_job(job_id)
+            logger.info("Deleted expired job %s", job_id)
+            return True
+        return False
+
+
+def insert_all_job_details() -> None:
+    """Fetch and store details for every discovered-but-unscraped job id."""
+    job_ids = repository.get_unscraped_job_ids()
+    logger.info("Fetching details for %d jobs...", len(job_ids))
+
+    retriever = LinkedInJobRetriever()
+    job_details = []
     for job_id in job_ids:
-        result = job_retriever.JobDetails(jobId=job_id)
-        if result is None:
-            continue
-        jobId, title, company, desc,location,posted_date, app_url,country = result
-        job_details_for_all_ids.append((job_id, title, company, desc,location,posted_date, app_url, country))
-    insert_job_details(job_details_for_all_ids)
+        result = retriever.fetch_job_details(job_id)
+        if result is not None:
+            job_details.append(result)
 
-def get_all_jobs_from_db():
-    sql_query = "SELECT job_id FROM job_processing_status where is_scraped = 0"
-    cursor.execute(sql_query)
-    job_ids_list = cursor.fetchall()
-    cleaned_list = []
-    for job_id in job_ids_list:
-        cleaned_list.append(job_id[0])
-
-    return cleaned_list
+    repository.insert_job_details(job_details)
+    # Drop roles we never want to apply to (internships, part-time).
+    repository.delete_jobs_with_excluded_titles()
+    logger.info("Stored details for %d jobs", len(job_details))
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     insert_all_job_details()
