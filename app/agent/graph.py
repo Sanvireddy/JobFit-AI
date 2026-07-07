@@ -26,41 +26,9 @@ from langgraph.prebuilt import ToolNode, tools_condition
 
 from app.agent.llm import get_agent_model
 from app.agent.nodes import extract_metadata_node, find_jobs_node
-from app.agent.state import AgentState, CandidateProfile, JobMatch
+from app.agent.prompts import AGENT_SYSTEM_PROMPT, format_shortlist
+from app.agent.state import AgentState, CandidateProfile
 from app.agent.tools import TOOLS
-
-AGENT_SYSTEM_PROMPT = (
-    "You are a job-application assistant. You are given a shortlist of jobs that "
-    "were already matched to the candidate's resume and enriched with structured "
-    "requirements. Decide which jobs are genuinely worth pursuing (strong fit and "
-    "the candidate looks eligible). For each job you recommend, call tailor_resume "
-    "and write_cover_letter (passing its job_id) to prepare the application "
-    "materials. Do NOT call mark_applied unless the user has explicitly confirmed "
-    "they applied. When done, briefly summarize which jobs you prepared and why. "
-    "Reference job_ids from the shortlist and stay strictly truthful — never "
-    "invent experience or job details."
-)
-
-
-def _matches_context(matches: list) -> str:
-    """Render the shortlisted matches into a compact text block for the model."""
-    if not matches:
-        return "No matching jobs were found for this resume."
-
-    lines = ["Shortlisted jobs:"]
-    for i, m in enumerate(matches, 1):
-        bits = [f"{i}. [{m.job_id}] {m.title} at {m.company}"]
-        bits.append(f"score {m.similarity_score:.2f}")
-        if m.location:
-            bits.append(m.location)
-        meta = m.metadata
-        if meta is not None:
-            if meta.experience_requirement and meta.experience_requirement.min_years_experience is not None:
-                bits.append(f"{meta.experience_requirement.min_years_experience}y exp")
-            if meta.relocation_requirement:
-                bits.append(meta.relocation_requirement.work_mode)
-        lines.append(" — ".join(bits))
-    return "\n".join(lines)
 
 
 def make_agent_node(model):
@@ -80,7 +48,7 @@ def make_agent_node(model):
 
         seed = [
             SystemMessage(content=AGENT_SYSTEM_PROMPT),
-            HumanMessage(content=_matches_context(state.get("matches") or [])),
+            HumanMessage(content=format_shortlist(state.get("matches") or [])),
         ]
         response = model.invoke(seed)
         return {"messages": seed + [response]}

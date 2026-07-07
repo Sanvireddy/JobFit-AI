@@ -22,6 +22,11 @@ from langchain_core.tools import InjectedToolCallId, tool
 from langgraph.prebuilt import InjectedState
 from langgraph.types import Command
 
+from app.agent.prompts import (
+    COVER_LETTER_SYSTEM_PROMPT,
+    TAILOR_RESUME_SYSTEM_PROMPT,
+    format_job_and_resume,
+)
 from app.agent.state import ApplicationRecord, JobMatch, TailoredArtifacts
 from app.schemas.job_metadata import JobMetadata
 
@@ -39,42 +44,34 @@ def find_jobs(
     """Find the jobs most relevant to a resume.
 
     Embeds the resume, searches the FAISS index, applies metadata compatibility
-    filtering, and returns the top matches as ``JobMatch`` records.
+    filtering, and returns the top matches as ``JobMatch`` records. Metadata
+    already persisted in the database rides along, so downstream enrichment
+    only needs to run for jobs that lack it.
     """
-    # Lazy import: embeddings pulls in sentence-transformers / torch and builds
-    # the embedding model at import time, so keep it out of module import.
-    from app.ingestion.embeddings import find_matching_jobs_for_resume
+    # Lazy import: the matcher pulls in sentence-transformers / torch on use.
+    from app.matching.matcher import find_matching_jobs_for_resume
 
-    result = find_matching_jobs_for_resume(
+    matched = find_matching_jobs_for_resume(
         resume_text=resume_text,
         top_k=top_k,
         apply_metadata_filtering=True,
         candidate_experience_years=candidate_experience_years,
     )
 
-    if not result.get("success"):
-        raise RuntimeError(result.get("error") or "Job matching failed.")
-
-    # NOTE: faiss_scores are aligned to search rank, but the underlying pipeline
-    # reorders/filters jobs before returning them, so this positional mapping is
-    # only approximate. TODO: have the pipeline attach a score to each job.
-    scores = result.get("faiss_scores") or []
-
-    matches: List[JobMatch] = []
-    for i, job in enumerate(result.get("similar_jobs", [])):
-        matches.append(
-            JobMatch(
-                job_id=str(job["job_id"]),
-                title=job.get("title") or "",
-                company=job.get("company") or "",
-                location=job.get("location"),
-                application_url=job.get("application_url"),
-                similarity_score=float(scores[i]) if i < len(scores) else 0.0,
-                passed_filters=True,
-                description=job.get("description"),
-            )
+    return [
+        JobMatch(
+            job_id=job.job_id,
+            title=job.title,
+            company=job.company,
+            location=job.location,
+            application_url=job.application_url,
+            similarity_score=job.similarity_score,
+            metadata=job.metadata,
+            passed_filters=True,
+            description=job.description,
         )
-    return matches
+        for job in matched
+    ]
 
 
 def extract_job_metadata(job_description: str) -> JobMetadata:
@@ -82,8 +79,8 @@ def extract_job_metadata(job_description: str) -> JobMetadata:
 
     Runs the local LLM extraction and returns a validated ``JobMetadata`` object.
     """
-    # Lazy import: metata_extractor talks to a running Ollama server.
-    from app.ingestion.metata_extractor import extract_metadata
+    # Lazy import: metadata_extractor talks to a running Ollama server.
+    from app.ingestion.metadata_extractor import extract_metadata
 
     return extract_metadata(job_description)
 
@@ -134,11 +131,8 @@ def tailor_resume(
             tool_call_id=tool_call_id)]})
 
     tailored = _groq_generate(
-        "You tailor resumes to a specific job. Rewrite the resume to emphasize "
-        "experience relevant to the job. Stay strictly truthful; never invent "
-        "experience the candidate does not have.",
-        f"JOB DESCRIPTION:\n{match.description}\n\nRESUME:\n"
-        f"{state['candidate'].resume_text}",
+        TAILOR_RESUME_SYSTEM_PROMPT,
+        format_job_and_resume(match.description, state["candidate"].resume_text),
     )
 
     artifacts = dict(state.get("artifacts") or {})
@@ -171,10 +165,8 @@ def write_cover_letter(
             tool_call_id=tool_call_id)]})
 
     letter = _groq_generate(
-        "You write concise, specific cover letters grounded in the candidate's "
-        "real experience. Do not invent facts.",
-        f"JOB DESCRIPTION:\n{match.description}\n\nRESUME:\n"
-        f"{state['candidate'].resume_text}",
+        COVER_LETTER_SYSTEM_PROMPT,
+        format_job_and_resume(match.description, state["candidate"].resume_text),
     )
 
     artifacts = dict(state.get("artifacts") or {})

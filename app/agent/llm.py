@@ -21,9 +21,7 @@ from typing import Optional
 from langchain_groq import ChatGroq
 
 from app.agent.tools import TOOLS
-
-# Tool-calling-capable default. Override with the GROQ_MODEL env var.
-DEFAULT_MODEL = "llama-3.3-70b-versatile"
+from app.config import GROQ_DEFAULT_MODEL as DEFAULT_MODEL
 
 
 def get_agent_model(
