@@ -13,3 +13,6 @@ ollama
 numpy
 faiss-cpu
 sentence-transformers
+langgraph
+langchain-core
+langchain-groq
