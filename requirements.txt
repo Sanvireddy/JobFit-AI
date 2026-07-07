@@ -1,18 +1,19 @@
+# Scraping
 requests
 selenium
-pandas
-pytz
-spacy
-rapidfuzz
 pycountry
 geotext
-langdetect
-deep_translator
+
+# Storage & schemas
 pydantic
-ollama
 numpy
 faiss-cpu
+
+# Models
+ollama
 sentence-transformers
+
+# Agent
 langgraph
 langchain-core
 langchain-groq
