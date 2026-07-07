@@ -83,6 +83,14 @@ class JobMatch(BaseModel):
         default=False,
         description="Whether the job survived metadata compatibility filtering",
     )
+    description: Optional[str] = Field(
+        default=None,
+        description=(
+            "Full job description text. Carried on the match so downstream nodes "
+            "(metadata extraction, cover-letter tailoring) can reason over the "
+            "job's content without re-querying the database"
+        ),
+    )
 
 
 class TailoredArtifacts(BaseModel):

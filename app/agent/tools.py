@@ -72,6 +72,7 @@ def find_jobs(
                 similarity_score=float(scores[i]) if i < len(scores) else 0.0,
                 # These jobs already survived metadata filtering in the pipeline.
                 passed_filters=True,
+                description=job.get("description"),
             )
         )
     return matches
