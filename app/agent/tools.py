@@ -1,25 +1,34 @@
 """Agent tools for JobFit-AI.
 
-Each tool is a thin wrapper over existing pipeline code that takes plain inputs
-and returns the typed domain objects defined in :mod:`app.agent.state`. The
-heavy pipeline modules (``embeddings`` pulls in sentence-transformers/torch,
-``metata_extractor`` talks to Ollama) are **lazy-imported inside the function
-bodies** on purpose: importing this module must stay cheap so it can be loaded
-and unit-tested without those runtime dependencies present.
+This module holds two different kinds of callables, and the distinction matters:
 
-Two things live here for each capability:
-- a plain typed function (e.g. ``find_jobs``) that holds the logic and is easy
-  to call and test directly;
-- a LangChain ``StructuredTool`` adapter (e.g. ``find_jobs_tool``) built from it,
-  collected in ``TOOLS`` for binding to the model / a LangGraph ``ToolNode``.
+1. **Pipeline logic functions** — ``find_jobs`` and ``extract_job_metadata``.
+   These are plain typed functions called directly by the deterministic nodes in
+   ``app.agent.nodes``. They lazy-import the heavy pipeline (torch/Ollama) inside
+   the body so importing this module stays cheap and testable.
+
+2. **Agent action tools** — ``tailor_resume``, ``write_cover_letter``,
+   ``mark_applied`` (collected in ``TOOLS``). These are what the Groq agent
+   actually calls to do work. The LLM only supplies a ``job_id``; the graph state
+   is injected via ``InjectedState`` and results are written back to typed state
+   fields via a returned ``Command``. These are the tools bound to the model and
+   run by the LangGraph ``ToolNode``.
 """
 
-from typing import List, Optional
+from typing import Annotated, List, Optional
 
-from langchain_core.tools import tool
+from langchain_core.messages import ToolMessage
+from langchain_core.tools import InjectedToolCallId, tool
+from langgraph.prebuilt import InjectedState
+from langgraph.types import Command
 
-from app.agent.state import JobMatch
+from app.agent.state import ApplicationRecord, JobMatch, TailoredArtifacts
 from app.schemas.job_metadata import JobMetadata
+
+
+# ---------------------------------------------------------------------------
+# Pipeline logic functions (called by nodes, not by the LLM)
+# ---------------------------------------------------------------------------
 
 
 def find_jobs(
@@ -29,16 +38,8 @@ def find_jobs(
 ) -> List[JobMatch]:
     """Find the jobs most relevant to a resume.
 
-    Embeds the resume, searches the FAISS index, and applies metadata
-    compatibility filtering, returning the top matches as structured
-    ``JobMatch`` records.
-
-    Args:
-        resume_text: The candidate's resume as plain text.
-        top_k: Maximum number of matching jobs to return.
-        candidate_experience_years: Years of experience the candidate has; jobs
-            requiring more than this are filtered out. Pass ``None`` to skip the
-            experience check.
+    Embeds the resume, searches the FAISS index, applies metadata compatibility
+    filtering, and returns the top matches as ``JobMatch`` records.
     """
     # Lazy import: embeddings pulls in sentence-transformers / torch and builds
     # the embedding model at import time, so keep it out of module import.
@@ -56,8 +57,7 @@ def find_jobs(
 
     # NOTE: faiss_scores are aligned to search rank, but the underlying pipeline
     # reorders/filters jobs before returning them, so this positional mapping is
-    # only approximate. TODO: have the pipeline attach a score to each job (e.g.
-    # via a job_id -> score map) and read it here instead.
+    # only approximate. TODO: have the pipeline attach a score to each job.
     scores = result.get("faiss_scores") or []
 
     matches: List[JobMatch] = []
@@ -70,7 +70,6 @@ def find_jobs(
                 location=job.get("location"),
                 application_url=job.get("application_url"),
                 similarity_score=float(scores[i]) if i < len(scores) else 0.0,
-                # These jobs already survived metadata filtering in the pipeline.
                 passed_filters=True,
                 description=job.get("description"),
             )
@@ -81,11 +80,7 @@ def find_jobs(
 def extract_job_metadata(job_description: str) -> JobMetadata:
     """Extract structured requirements from a single job description.
 
-    Runs the local LLM extraction and returns a validated ``JobMetadata``
-    object (experience, languages, education, relocation/work mode).
-
-    Args:
-        job_description: The raw job description text.
+    Runs the local LLM extraction and returns a validated ``JobMetadata`` object.
     """
     # Lazy import: metata_extractor talks to a running Ollama server.
     from app.ingestion.metata_extractor import extract_metadata
@@ -93,9 +88,130 @@ def extract_job_metadata(job_description: str) -> JobMetadata:
     return extract_metadata(job_description)
 
 
-# LLM-facing tool adapters (schemas are inferred from the type hints + docstrings
-# above). Bind these to the model or a LangGraph ToolNode.
-find_jobs_tool = tool(find_jobs)
-extract_job_metadata_tool = tool(extract_job_metadata)
+# ---------------------------------------------------------------------------
+# Agent action tools (called by the LLM; read state, write state)
+# ---------------------------------------------------------------------------
 
-TOOLS = [find_jobs_tool, extract_job_metadata_tool]
+
+def _find_match(state: dict, job_id: str) -> Optional[JobMatch]:
+    for match in state.get("matches") or []:
+        if match.job_id == job_id:
+            return match
+    return None
+
+
+def _groq_generate(system_prompt: str, user_prompt: str) -> str:
+    """Single-shot Groq generation used by the tailoring tools.
+
+    Kept as a module-level function so tests can patch it without a GROQ key.
+    """
+    from langchain_core.messages import HumanMessage, SystemMessage
+
+    from app.agent.llm import get_agent_model
+
+    model = get_agent_model(bind_tools=False)
+    reply = model.invoke(
+        [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]
+    )
+    return reply.content
+
+
+@tool
+def tailor_resume(
+    job_id: str,
+    state: Annotated[dict, InjectedState],
+    tool_call_id: Annotated[str, InjectedToolCallId],
+) -> Command:
+    """Tailor the candidate's resume to one shortlisted job.
+
+    Args:
+        job_id: The id of a job already present in the shortlist.
+    """
+    match = _find_match(state, job_id)
+    if match is None or not match.description:
+        return Command(update={"messages": [ToolMessage(
+            f"No shortlisted job with a description for job_id={job_id}.",
+            tool_call_id=tool_call_id)]})
+
+    tailored = _groq_generate(
+        "You tailor resumes to a specific job. Rewrite the resume to emphasize "
+        "experience relevant to the job. Stay strictly truthful; never invent "
+        "experience the candidate does not have.",
+        f"JOB DESCRIPTION:\n{match.description}\n\nRESUME:\n"
+        f"{state['candidate'].resume_text}",
+    )
+
+    artifacts = dict(state.get("artifacts") or {})
+    existing = artifacts.get(job_id) or TailoredArtifacts(job_id=job_id)
+    artifacts[job_id] = existing.model_copy(update={"tailored_resume": tailored})
+
+    return Command(update={
+        "artifacts": artifacts,
+        "messages": [ToolMessage(
+            f"Tailored resume for {match.title} at {match.company} (job {job_id}).",
+            tool_call_id=tool_call_id)],
+    })
+
+
+@tool
+def write_cover_letter(
+    job_id: str,
+    state: Annotated[dict, InjectedState],
+    tool_call_id: Annotated[str, InjectedToolCallId],
+) -> Command:
+    """Write a cover letter for one shortlisted job.
+
+    Args:
+        job_id: The id of a job already present in the shortlist.
+    """
+    match = _find_match(state, job_id)
+    if match is None or not match.description:
+        return Command(update={"messages": [ToolMessage(
+            f"No shortlisted job with a description for job_id={job_id}.",
+            tool_call_id=tool_call_id)]})
+
+    letter = _groq_generate(
+        "You write concise, specific cover letters grounded in the candidate's "
+        "real experience. Do not invent facts.",
+        f"JOB DESCRIPTION:\n{match.description}\n\nRESUME:\n"
+        f"{state['candidate'].resume_text}",
+    )
+
+    artifacts = dict(state.get("artifacts") or {})
+    existing = artifacts.get(job_id) or TailoredArtifacts(job_id=job_id)
+    artifacts[job_id] = existing.model_copy(update={"cover_letter": letter})
+
+    return Command(update={
+        "artifacts": artifacts,
+        "messages": [ToolMessage(
+            f"Wrote cover letter for {match.title} at {match.company} (job {job_id}).",
+            tool_call_id=tool_call_id)],
+    })
+
+
+@tool
+def mark_applied(
+    job_id: str,
+    state: Annotated[dict, InjectedState],
+    tool_call_id: Annotated[str, InjectedToolCallId],
+) -> Command:
+    """Record that the candidate has applied to a job (status tracking only).
+
+    This updates application status in state; it does NOT submit anything
+    externally. Real submission should sit behind a human-approval gate.
+
+    Args:
+        job_id: The id of the job to mark as applied.
+    """
+    applications = dict(state.get("applications") or {})
+    existing = applications.get(job_id) or ApplicationRecord(job_id=job_id)
+    applications[job_id] = existing.model_copy(update={"status": "applied"})
+
+    return Command(update={
+        "applications": applications,
+        "messages": [ToolMessage(
+            f"Marked job {job_id} as applied.", tool_call_id=tool_call_id)],
+    })
+
+
+TOOLS = [tailor_resume, write_cover_letter, mark_applied]
