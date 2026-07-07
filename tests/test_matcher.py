@@ -39,6 +39,55 @@ class TestFilterJobsByMetadata:
     def test_keeps_jobs_with_no_metadata_row(self):
         assert len(filter_jobs_by_metadata([job()], {})) == 1
 
+    def test_drops_jobs_missing_a_must_have_skill(self):
+        jobs = [dict(job(), description="We use Python and SQL daily.")]
+        assert filter_jobs_by_metadata(
+            jobs, {}, must_have_skills=["python", "aws"]
+        ) == []
+
+    def test_keeps_jobs_mentioning_all_must_have_skills(self):
+        jobs = [dict(job(), description="We use Python and SQL daily.")]
+        assert len(
+            filter_jobs_by_metadata(jobs, {}, must_have_skills=["Python", "sql"])
+        ) == 1
+
+    def test_drops_jobs_outside_preferred_locations(self):
+        jobs = [dict(job(), location="Bengaluru, India", country="India")]
+        assert filter_jobs_by_metadata(
+            jobs, {}, preferred_locations=["Germany"]
+        ) == []
+
+    def test_keeps_jobs_in_preferred_locations(self):
+        jobs = [dict(job(), location="Berlin, Germany", country="Germany")]
+        assert len(
+            filter_jobs_by_metadata(jobs, {}, preferred_locations=["germany"])
+        ) == 1
+
+    def test_remote_jobs_bypass_location_preference(self):
+        jobs = [dict(job(), location="Bengaluru, India", country="India")]
+        metadata = {"1": {"work_mode": "remote"}}
+        assert len(
+            filter_jobs_by_metadata(jobs, metadata, preferred_locations=["Germany"])
+        ) == 1
+
+    def test_relocation_openness_bypasses_location_preference(self):
+        jobs = [dict(job(), location="Bengaluru, India", country="India")]
+        assert len(filter_jobs_by_metadata(
+            jobs, {}, preferred_locations=["Germany"], open_to_relocation=True
+        )) == 1
+
+    def test_drops_jobs_explicitly_refusing_sponsorship_when_needed(self):
+        metadata = {"1": {"visa_sponsorship_available": False}}
+        assert filter_jobs_by_metadata(
+            [job()], metadata, requires_visa_sponsorship=True
+        ) == []
+
+    def test_keeps_jobs_with_unknown_sponsorship_when_needed(self):
+        metadata = {"1": {"visa_sponsorship_available": None}}
+        assert len(filter_jobs_by_metadata(
+            [job()], metadata, requires_visa_sponsorship=True
+        )) == 1
+
 
 class TestMetadataFromRow:
     def test_none_or_empty_row_returns_none(self):

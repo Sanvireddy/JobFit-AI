@@ -23,6 +23,41 @@ from pydantic import BaseModel, Field
 from app.schemas.job_metadata import JobMetadata
 
 
+def merge_dicts(left: Optional[dict], right: Optional[dict]) -> dict:
+    """Reducer for dict-valued state fields: merge updates key-by-key.
+
+    Without this, two tool calls in the same superstep (the model routinely
+    emits parallel tool calls) would both write the whole dict and LangGraph
+    would raise on the concurrent update — or silently drop one. With it,
+    tools return only their {job_id: value} delta and updates never collide.
+    """
+    return {**(left or {}), **(right or {})}
+
+
+def merge_artifacts(left: Optional[dict], right: Optional[dict]) -> dict:
+    """Reducer for ``artifacts``: merge per job_id AND per field.
+
+    ``tailor_resume`` and ``write_cover_letter`` are routinely called for the
+    same job in one model turn, so both deltas land in the same superstep. A
+    plain key-level merge would keep only the second artifact (dropping the
+    resume or the letter); this merges non-None fields into the existing
+    ``TailoredArtifacts`` so both documents survive.
+    """
+    merged = dict(left or {})
+    for job_id, incoming in (right or {}).items():
+        current = merged.get(job_id)
+        if current is None:
+            merged[job_id] = incoming
+            continue
+        updates = {
+            field: value
+            for field, value in incoming.model_dump().items()
+            if field != "job_id" and value is not None
+        }
+        merged[job_id] = current.model_copy(update=updates)
+    return merged
+
+
 # ---------------------------------------------------------------------------
 # 1. Domain schemas — structured data passed between tools / nodes
 # ---------------------------------------------------------------------------
@@ -139,9 +174,11 @@ class AgentState(TypedDict):
 
     Reducer note: ``messages`` uses ``add_messages`` so each agent/tool turn
     *appends* to the conversation rather than overwriting it — this is what
-    makes the tool-calling loop work. All other fields use the default
-    "overwrite on update" behavior, which is appropriate since a node computes
-    the full new value (e.g. the complete ``matches`` list) each time.
+    makes the tool-calling loop work. ``artifacts`` and ``applications`` use
+    ``merge_dicts`` so tools return per-job deltas that merge safely even when
+    the model emits several tool calls in one turn. The remaining fields use
+    the default "overwrite on update" behavior, which is appropriate since a
+    node computes the full new value (e.g. the complete ``matches`` list).
     """
 
     # Conversation history between the model and the tools.
@@ -151,10 +188,15 @@ class AgentState(TypedDict):
     candidate: CandidateProfile
     top_k: int
 
-    # Working data produced as the graph runs.
+    # When True, the intake node interrupts to ask the candidate for their
+    # preferences (skills, locations, visa) before matching runs.
+    interactive: bool
+
+    # Working data produced as the graph runs. Both dicts merge per-key (see
+    # merge_dicts) so parallel tool calls can update different jobs safely.
     matches: List[JobMatch]
-    artifacts: Dict[str, TailoredArtifacts]      # keyed by job_id
-    applications: Dict[str, ApplicationRecord]   # keyed by job_id
+    artifacts: Annotated[Dict[str, TailoredArtifacts], merge_artifacts]
+    applications: Annotated[Dict[str, ApplicationRecord], merge_dicts]
 
     # Populated if a node fails, so the graph can route to error handling.
     error: Optional[str]

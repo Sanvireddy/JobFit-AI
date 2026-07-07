@@ -98,6 +98,10 @@ def filter_jobs_by_metadata(
     jobs: List[Dict],
     job_metadata_map: Dict[str, Dict],
     candidate_experience_years: Optional[int] = None,
+    must_have_skills: Optional[List[str]] = None,
+    preferred_locations: Optional[List[str]] = None,
+    open_to_relocation: bool = False,
+    requires_visa_sponsorship: bool = False,
 ) -> List[Dict]:
     """Keep only jobs the candidate is plausibly compatible with.
 
@@ -108,6 +112,13 @@ def filter_jobs_by_metadata(
     - It does not explicitly require a non-English language. Jobs whose
       language requirement is unknown are kept, since "unknown" should not
       silently drop otherwise-relevant matches.
+    - Every ``must_have_skills`` entry appears in the job description
+      (case-insensitive substring; skipped when the list is empty).
+    - The job is in one of ``preferred_locations`` — or is remote, or the
+      candidate is open to relocation (skipped when the list is empty).
+    - When the candidate needs visa sponsorship, jobs that explicitly say no
+      sponsorship are dropped; unknown (None) is kept, mirroring the language
+      rule: unknowns should not silently drop otherwise-relevant matches.
     """
     filtered = []
     for job in jobs:
@@ -133,6 +144,28 @@ def filter_jobs_by_metadata(
         if metadata.get("requires_only_english") is False:
             continue
 
+        if must_have_skills:
+            description = (job.get("description") or "").lower()
+            if not all(skill.lower() in description for skill in must_have_skills):
+                continue
+
+        if preferred_locations and not open_to_relocation:
+            job_place = " ".join(
+                part for part in (job.get("location"), job.get("country")) if part
+            ).lower()
+            is_remote = metadata.get("work_mode") == "remote"
+            in_preferred = any(
+                loc.lower() in job_place for loc in preferred_locations if loc.strip()
+            )
+            if not (is_remote or in_preferred):
+                continue
+
+        if (
+            requires_visa_sponsorship
+            and metadata.get("visa_sponsorship_available") is False
+        ):
+            continue
+
         filtered.append(job)
     return filtered
 
@@ -142,6 +175,10 @@ def find_matching_jobs_for_resume(
     top_k: int = 10,
     apply_metadata_filtering: bool = True,
     candidate_experience_years: Optional[int] = None,
+    must_have_skills: Optional[List[str]] = None,
+    preferred_locations: Optional[List[str]] = None,
+    open_to_relocation: bool = False,
+    requires_visa_sponsorship: bool = False,
 ) -> List[MatchedJob]:
     """Return the top-k jobs most similar to a resume, best match first.
 
@@ -173,7 +210,15 @@ def find_matching_jobs_for_resume(
     )
 
     if apply_metadata_filtering:
-        jobs = filter_jobs_by_metadata(jobs, metadata_map, candidate_experience_years)
+        jobs = filter_jobs_by_metadata(
+            jobs,
+            metadata_map,
+            candidate_experience_years=candidate_experience_years,
+            must_have_skills=must_have_skills,
+            preferred_locations=preferred_locations,
+            open_to_relocation=open_to_relocation,
+            requires_visa_sponsorship=requires_visa_sponsorship,
+        )
 
     jobs.sort(
         key=lambda job: score_by_faiss_index.get(job["faiss_index"], 0.0),

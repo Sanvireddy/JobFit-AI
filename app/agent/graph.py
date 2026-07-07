@@ -1,19 +1,32 @@
 """LangGraph wiring for the JobFit-AI agent.
 
-Assembles the full pipeline: a deterministic spine followed by a Groq-powered
-agent loop.
+Assembles the full pipeline: a deterministic spine, a Groq-powered agent loop,
+and two human-in-the-loop pauses.
 
-    START -> find_jobs -> extract_metadata -> agent  <-> tools
-                 |                               |
-                 └── (on error) ──> END          └── (no tool calls) ──> END
+    START -> intake -> find_jobs -> extract_metadata -> agent <-> tools
+               |           |                              |
+      (interactive only:   └── (on error) ──> END         └── (no tool calls)
+       interrupt for                                          ──> human_review
+       preferences)                                                  |
+                                                    (interrupt: approve/skip
+                                                     each prepared job) -> END
 
+- ``intake`` interrupts (only with ``interactive=True``) to collect the
+  candidate's preferences, which feed the compatibility filter.
 - ``find_jobs`` / ``extract_metadata`` are deterministic nodes (embed+filter,
   then LLM metadata enrichment). A conditional edge after ``find_jobs`` bails to
   END if matching recorded ``state["error"]``.
 - ``agent`` invokes the Groq model over the conversation, having been seeded with
   the shortlisted matches. It either emits tool calls (routed to ``tools`` by the
   prebuilt ``tools_condition``, which loop back to ``agent``) or finishes,
-  routing to END.
+  routing to ``human_review``.
+- ``human_review`` interrupts so a person approves or skips every prepared
+  application; the model can never mark anything applied itself. It is a no-op
+  (and does not interrupt) when nothing was prepared.
+
+Interrupts require compiling with a checkpointer — pass one via
+``build_graph(checkpointer=...)`` (the CLI uses ``MemorySaver``). Tests build
+without one; both interrupting nodes are no-ops on their default paths.
 
 The model is *injected* into ``build_graph`` so the graph can be built and tested
 without a GROQ_API_KEY (pass a fake model); in production it is lazily created
@@ -25,7 +38,12 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
 
 from app.agent.llm import get_agent_model
-from app.agent.nodes import extract_metadata_node, find_jobs_node
+from app.agent.nodes import (
+    extract_metadata_node,
+    find_jobs_node,
+    human_review_node,
+    intake_node,
+)
 from app.agent.prompts import AGENT_SYSTEM_PROMPT, format_shortlist
 from app.agent.state import AgentState, CandidateProfile
 from app.agent.tools import TOOLS
@@ -61,7 +79,7 @@ def _route_after_find_jobs(state: AgentState) -> str:
     return "end" if state.get("error") else "continue"
 
 
-def build_graph(model=None, tools=None):
+def build_graph(model=None, tools=None, checkpointer=None):
     """Assemble and compile the full agent graph.
 
     Args:
@@ -69,6 +87,10 @@ def build_graph(model=None, tools=None):
             lazily via ``get_agent_model()`` (requires GROQ_API_KEY). Inject a
             fake model to build/test the graph without a key.
         tools: Tool list for the ToolNode. Defaults to ``TOOLS``.
+        checkpointer: Optional LangGraph checkpointer. Required for the
+            interactive intake and human-review interrupts to pause/resume;
+            without one the graph still runs, but only the non-interrupting
+            paths are reachable.
     """
     if model is None:
         model = get_agent_model()
@@ -77,30 +99,39 @@ def build_graph(model=None, tools=None):
 
     builder = StateGraph(AgentState)
 
+    builder.add_node("intake", intake_node)
     builder.add_node("find_jobs", find_jobs_node)
     builder.add_node("extract_metadata", extract_metadata_node)
     builder.add_node("agent", make_agent_node(model))
     builder.add_node("tools", ToolNode(tools))
+    builder.add_node("human_review", human_review_node)
 
-    builder.add_edge(START, "find_jobs")
+    builder.add_edge(START, "intake")
+    builder.add_edge("intake", "find_jobs")
     builder.add_conditional_edges(
         "find_jobs",
         _route_after_find_jobs,
         {"continue": "extract_metadata", "end": END},
     )
     builder.add_edge("extract_metadata", "agent")
-    # tools_condition routes to "tools" when the last message has tool calls,
-    # otherwise to END.
-    builder.add_conditional_edges("agent", tools_condition)
+    # tools_condition routes to "tools" when the last message has tool calls;
+    # its END outcome is remapped to the human-review gate.
+    builder.add_conditional_edges(
+        "agent",
+        tools_condition,
+        {"tools": "tools", END: "human_review"},
+    )
     builder.add_edge("tools", "agent")
+    builder.add_edge("human_review", END)
 
-    return builder.compile()
+    return builder.compile(checkpointer=checkpointer)
 
 
 def initial_state(
     resume_text: str,
     top_k: int = 5,
     experience_years: int = 3,
+    interactive: bool = False,
 ) -> AgentState:
     """Build a fresh AgentState to invoke the graph with."""
     return {
@@ -110,6 +141,7 @@ def initial_state(
             experience_years=experience_years,
         ),
         "top_k": top_k,
+        "interactive": interactive,
         "matches": [],
         "artifacts": {},
         "applications": {},
