@@ -29,71 +29,71 @@ from app.schemas.job_metadata import JobMetadata
 
 
 class CandidateProfile(BaseModel):
-    """The candidate the agent is finding jobs for."""
+    """The candidate the agent is finding jobs for"""
 
     resume_text: str = Field(
-        description="Full resume content as plain text."
+        description="Full resume content as plain text"
     )
     experience_years: Optional[int] = Field(
         default=None,
         description=(
             "Years of professional experience the candidate has. Feeds the "
             "experience filter (jobs requiring more than this are dropped). "
-            "None skips the experience check."
+            "None skips the experience check"
         ),
     )
     must_have_skills: List[str] = Field(
         default_factory=list,
-        description="Skills the candidate wants present in matched jobs.",
+        description="Skills the candidate wants present in matched jobs",
     )
     preferred_locations: List[str] = Field(
         default_factory=list,
-        description="Locations/countries the candidate is targeting.",
+        description="Locations/countries the candidate is targeting",
     )
     open_to_relocation: bool = Field(
         default=False,
-        description="Whether the candidate is willing to relocate.",
+        description="Whether the candidate is willing to relocate",
     )
     requires_visa_sponsorship: bool = Field(
         default=False,
-        description="Whether the candidate needs visa sponsorship.",
+        description="Whether the candidate needs visa sponsorship",
     )
 
 
 class JobMatch(BaseModel):
-    """A single job returned by the matching pipeline."""
+    """A single job returned by the matching pipeline"""
 
-    job_id: str = Field(description="Stable job identifier (LinkedIn job id).")
-    title: str = Field(description="Job title.")
-    company: str = Field(description="Hiring company name.")
+    job_id: str = Field(description="Stable job identifier (LinkedIn job id)")
+    title: str = Field(description="Job title")
+    company: str = Field(description="Hiring company name")
     location: Optional[str] = Field(
-        default=None, description="Formatted job location."
+        default=None, description="Formatted job location"
     )
     application_url: Optional[str] = Field(
-        default=None, description="External or easy-apply URL, if available."
+        default=None, description="External or easy-apply URL, if available"
     )
     similarity_score: float = Field(
-        description="FAISS cosine-similarity score between resume and job."
+        description="FAISS cosine-similarity score between resume and job"
     )
     metadata: Optional[JobMetadata] = Field(
         default=None,
-        description="Structured requirements extracted for this job.",
+        description="Structured requirements extracted for this job",
     )
     passed_filters: bool = Field(
         default=False,
-        description="Whether the job survived metadata compatibility filtering.",
+        description="Whether the job survived metadata compatibility filtering",
     )
 
 
 class TailoredArtifacts(BaseModel):
-    """Per-job documents produced for an application."""
+    """Per-job documents produced for an application"""
 
-    job_id: str = Field(description="Job this artifact set belongs to.")
+    job_id: str = Field(description="Job this artifact set belongs to")
     tailored_resume: Optional[str] = Field(
-        default=None, description="Resume tailored to this job."
+        default=None, description="Resume tailored to this job"
     )
     cover_letter: Optional[str] = Field(
-        default=None, description="Cover letter written for this job."
+        default=None, description="Cover letter tailored for this job"
     )
 
 
@@ -108,16 +108,16 @@ ApplicationStatus = Literal[
 
 
 class ApplicationRecord(BaseModel):
-    """Tracks where a given job is in the application workflow."""
+    """Tracks where a given job is in the application workflow"""
 
-    job_id: str = Field(description="Job this record tracks.")
+    job_id: str = Field(description="Job this record tracks")
     status: ApplicationStatus = Field(
         default="shortlisted",
-        description="Current stage of the application for this job.",
+        description="Current stage of the application for this job",
     )
     notes: Optional[str] = Field(
         default=None,
-        description="Free-text notes (e.g. why a job was skipped).",
+        description="Free-text notes (e.g. why a job was skipped)",
     )
 
 
