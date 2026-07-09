@@ -28,16 +28,19 @@ def get_agent_model(
     model: Optional[str] = None,
     temperature: float = 0.0,
     bind_tools: bool = True,
+    tools: Optional[list] = None,
 ) -> ChatGroq:
-    """Return a configured Groq chat model, optionally bound with the agent tools.
+    """Return a configured Groq chat model, optionally bound with agent tools.
 
     Args:
         model: Explicit model id. Falls back to ``GROQ_MODEL`` then
             ``DEFAULT_MODEL``.
         temperature: Sampling temperature; 0.0 for deterministic tool routing
             and structured extraction.
-        bind_tools: When True (default), bind ``TOOLS`` so the model can emit
+        bind_tools: When True (default), bind tools so the model can emit
             tool calls for a LangGraph ``ToolNode`` to execute.
+        tools: Specific tool roster to bind (e.g. ``SCREENER_TOOLS``).
+            Defaults to the full ``TOOLS`` union when ``bind_tools`` is True.
 
     Raises:
         RuntimeError: if ``GROQ_API_KEY`` is not set.
@@ -55,4 +58,6 @@ def get_agent_model(
         temperature=temperature,
     )
 
+    if tools is not None:
+        return llm.bind_tools(tools)
     return llm.bind_tools(TOOLS) if bind_tools else llm

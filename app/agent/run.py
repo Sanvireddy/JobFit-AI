@@ -1,8 +1,9 @@
-"""CLI entrypoint for the JobFit-AI agent.
+"""CLI entrypoint for the JobFit-AI agent team.
 
 Reads a resume, runs the full graph (optional intake -> match -> enrich ->
-agent loop -> human review), prints the agent's summary, and saves artifacts
-for approved jobs to ``outputs/<job_id>/``.
+screener agent -> typed handoff -> preparer agent -> human review), prints
+each agent's summary and the screening decisions, and saves artifacts for
+approved jobs to ``outputs/<job_id>/``.
 
 The graph pauses at ``interrupt()`` points (profile intake with
 ``--interactive``, and application approval whenever materials were prepared);
@@ -114,9 +115,21 @@ def main() -> None:
     if state.get("error"):
         raise SystemExit(f"Agent run failed: {state['error']}")
 
+    if state.get("screener_summary"):
+        print("\n=== Screening summary ===\n")
+        print(state["screener_summary"])
+
+    screening = state.get("screening") or {}
+    if screening:
+        print("\n=== Screening decisions ===\n")
+        for job_id, decision in sorted(screening.items()):
+            verdict = "pursue" if decision.pursue else "skip"
+            print(f"  {job_id}: {verdict} — {decision.reason}")
+
+    # After the handoff wipe, any remaining messages belong to the preparer.
     messages = state.get("messages") or []
-    if messages:
-        print("\n=== Agent summary ===\n")
+    if messages and messages[-1].content:
+        print("\n=== Preparation summary ===\n")
         print(messages[-1].content)
 
     applications = state.get("applications") or {}
