@@ -7,13 +7,16 @@ This module holds two different kinds of callables, and the distinction matters:
    ``app.agent.nodes``. They lazy-import the heavy pipeline (torch/Ollama) inside
    the body so importing this module stays cheap and testable.
 
-2. **Agent action tools** — collected in ``TOOLS``, bound to the Groq model and
-   run by the LangGraph ``ToolNode``. They come in three flavors:
+2. **Agent action tools** — split into two rosters (``SCREENER_TOOLS`` /
+   ``PREPARER_TOOLS``), each bound to its own agent and run by that agent's
+   LangGraph ``ToolNode``. They come in three flavors:
 
    - *Investigation tools* (``analyze_fit``, ``get_job_description``,
-     ``check_job_active``, ``research_company``) let the agent gather evidence
-     before deciding which jobs to pursue. ``analyze_fit`` is deliberately
-     deterministic — it reports facts; the agent supplies the judgment.
+     ``check_job_active``) let the screener gather evidence before deciding
+     which jobs to pursue; ``record_screening_decision`` writes its verdicts
+     into the typed handoff (``state["screening"]``). ``analyze_fit`` is
+     deliberately deterministic — it reports facts; the agent supplies the
+     judgment.
    - *Generation tools* (``tailor_resume``, ``write_cover_letter``) produce the
      application documents through a critique-and-revise loop: each draft is
      reviewed by an LLM judge for truthfulness against the original resume and
@@ -47,6 +50,7 @@ from app.agent.state import (
     ApplicationRecord,
     CandidateProfile,
     JobMatch,
+    ScreeningDecision,
     TailoredArtifacts,
 )
 from app.schemas.job_metadata import JobMetadata
@@ -372,6 +376,45 @@ def check_job_active(
 
 
 @tool
+def record_screening_decision(
+    job_id: str,
+    pursue: bool,
+    reason: str,
+    state: Annotated[dict, InjectedState],
+    tool_call_id: Annotated[str, InjectedToolCallId],
+) -> Command:
+    """Record your screening verdict for one shortlisted job.
+
+    Call this exactly once per shortlisted job after investigating it. Jobs
+    with pursue=True are handed to the preparer agent; jobs with pursue=False
+    are marked skipped with your reason.
+
+    Args:
+        job_id: The id of a job already present in the shortlist.
+        pursue: True to hand the job off for application materials.
+        reason: One or two sentences justifying the decision.
+    """
+    match = _find_match(state, job_id)
+    if match is None:
+        return Command(update={"messages": [ToolMessage(
+            f"No shortlisted job with job_id={job_id}; decision not recorded.",
+            tool_call_id=tool_call_id)]})
+
+    update = {
+        "screening": {job_id: ScreeningDecision(
+            job_id=job_id, pursue=pursue, reason=reason)},
+        "messages": [ToolMessage(
+            f"Recorded decision for {match.title} at {match.company} "
+            f"(job {job_id}): {'pursue' if pursue else 'skip'}.",
+            tool_call_id=tool_call_id)],
+    }
+    if not pursue:
+        update["applications"] = {job_id: ApplicationRecord(
+            job_id=job_id, status="skipped", notes=f"screened out: {reason}")}
+    return Command(update=update)
+
+
+@tool
 def research_company(company_name: str) -> str:
     """Look up brief factual background about a company.
 
@@ -507,11 +550,22 @@ def write_cover_letter(
     })
 
 
-TOOLS = [
+# Per-agent tool rosters: the screener investigates and decides, the preparer
+# writes. Neither agent is bound with the other's tools, so the capability
+# split is enforced at the model level, not just by prompt.
+SCREENER_TOOLS = [
     analyze_fit,
     get_job_description,
     check_job_active,
+    record_screening_decision,
+]
+
+PREPARER_TOOLS = [
     research_company,
     tailor_resume,
     write_cover_letter,
 ]
+
+# Union roster, kept for callers that need every tool (e.g. binding a single
+# test model for the whole graph).
+TOOLS = SCREENER_TOOLS + PREPARER_TOOLS

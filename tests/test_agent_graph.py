@@ -7,9 +7,25 @@ from langgraph.types import Command
 import app.agent.nodes as nodes
 import app.agent.tools as tools_mod
 from app.agent.graph import build_graph, initial_state
-from app.agent.prompts import format_shortlist
-from app.agent.state import CandidateProfile, JobMatch, merge_artifacts, TailoredArtifacts
-from app.agent.tools import TOOLS, DraftReview, _find_match, analyze_fit
+from app.agent.prompts import (
+    PREPARER_SYSTEM_PROMPT,
+    format_handoff,
+    format_shortlist,
+)
+from app.agent.state import (
+    CandidateProfile,
+    JobMatch,
+    ScreeningDecision,
+    TailoredArtifacts,
+    merge_artifacts,
+)
+from app.agent.tools import (
+    TOOLS,
+    DraftReview,
+    _find_match,
+    analyze_fit,
+    record_screening_decision,
+)
 from app.schemas.job_metadata import ExperienceRequirement, JobMetadata
 
 
@@ -23,6 +39,18 @@ class FakeModel:
     def invoke(self, messages):
         self.calls.append(messages)
         return AIMessage(content=self.reply)
+
+
+class ScriptedModel:
+    """Returns scripted responses in order; records each call's messages."""
+
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = []
+
+    def invoke(self, messages):
+        self.calls.append(list(messages))
+        return self.responses.pop(0)
 
 
 class FakeToolCallModel:
@@ -58,18 +86,21 @@ def approve_all_reviews(monkeypatch):
     )
 
 
-def test_happy_path_reaches_agent_and_ends(monkeypatch):
+def test_happy_path_reaches_screener_and_ends(monkeypatch):
     monkeypatch.setattr(nodes, "find_jobs", lambda *a, **kw: [fake_match()])
-    model = FakeModel()
+    model = FakeModel(reply="Screened 1 job.")
 
     graph = build_graph(model=model, tools=TOOLS)
     final_state = graph.invoke(initial_state("my resume", top_k=3))
 
     assert final_state["error"] is None
     assert [m.job_id for m in final_state["matches"]] == ["42"]
-    # Model was seeded with system prompt + shortlist and replied once.
+    # Screener was seeded with system prompt + shortlist and replied once;
+    # with no pursued jobs the preparer never runs.
     assert len(model.calls) == 1
-    assert final_state["messages"][-1].content == "Prepared 1 job."
+    # The handoff stashed the screener's summary and cleared the channel.
+    assert final_state["screener_summary"] == "Screened 1 job."
+    assert final_state["messages"] == []
 
 
 def test_matching_failure_routes_to_end_without_calling_model(monkeypatch):
@@ -183,6 +214,96 @@ def test_interactive_intake_fills_profile_and_feeds_matcher(monkeypatch):
     assert candidate.preferred_locations == ["Germany"]
     assert candidate.open_to_relocation is True
     assert candidate.requires_visa_sponsorship is False
+
+
+def test_two_agent_flow_screener_handoff_preparer(monkeypatch):
+    """Screener records a pursue decision; preparer runs in a fresh context."""
+    monkeypatch.setattr(nodes, "find_jobs", lambda *a, **kw: [fake_match()])
+    approve_all_reviews(monkeypatch)
+
+    model = ScriptedModel([
+        AIMessage(content="", tool_calls=[{
+            "name": "record_screening_decision",
+            "args": {"job_id": "42", "pursue": True, "reason": "strong fit"},
+            "id": "s1",
+        }]),
+        AIMessage(content="Screened 1 job."),
+        AIMessage(content="", tool_calls=[
+            {"name": "tailor_resume", "args": {"job_id": "42"}, "id": "p1"},
+        ]),
+        AIMessage(content="Prepared job 42."),
+    ])
+    graph = build_graph(model=model, tools=TOOLS, checkpointer=MemorySaver())
+    config = {"configurable": {"thread_id": "ma1"}}
+
+    state = graph.invoke(initial_state("my resume"), config)
+
+    # Typed handoff recorded, screener summary stashed.
+    assert state["screening"]["42"].pursue is True
+    assert state["screener_summary"] == "Screened 1 job."
+
+    # Context isolation: the preparer's first call is a FRESH 2-message seed
+    # (its own system prompt + the rendered handoff), not the screener's
+    # transcript — the agents communicate only through typed state.
+    preparer_seed = model.calls[2]
+    assert len(preparer_seed) == 2
+    assert preparer_seed[0].content == PREPARER_SYSTEM_PROMPT
+    assert "strong fit" in preparer_seed[1].content
+    assert "[42]" in preparer_seed[1].content
+
+    # Preparer produced the artifact, then the human gate fired.
+    assert state["artifacts"]["42"].tailored_resume == "DRAFT"
+    assert state["__interrupt__"][0].value["type"] == "application_approval"
+
+    final = graph.invoke(Command(resume={"42": "y"}), config)
+    assert final["applications"]["42"].status == "applied"
+
+
+def test_screener_skip_all_bypasses_preparer(monkeypatch):
+    monkeypatch.setattr(nodes, "find_jobs", lambda *a, **kw: [fake_match()])
+
+    model = ScriptedModel([
+        AIMessage(content="", tool_calls=[{
+            "name": "record_screening_decision",
+            "args": {"job_id": "42", "pursue": False, "reason": "too senior"},
+            "id": "s1",
+        }]),
+        AIMessage(content="Nothing worth pursuing."),
+    ])
+    graph = build_graph(model=model, tools=TOOLS, checkpointer=MemorySaver())
+    final = graph.invoke(
+        initial_state("my resume"), {"configurable": {"thread_id": "ma2"}}
+    )
+
+    # Screener spoke twice; the preparer never ran and nothing interrupted.
+    assert len(model.calls) == 2
+    assert "__interrupt__" not in final
+    assert final["screening"]["42"].pursue is False
+    assert final["applications"]["42"].status == "skipped"
+    assert "screened out: too senior" in final["applications"]["42"].notes
+    assert final["screener_summary"] == "Nothing worth pursuing."
+
+
+def test_record_screening_decision_rejects_unknown_job():
+    command = record_screening_decision.func(
+        job_id="zzz", pursue=True, reason="r",
+        state={"matches": [fake_match()]}, tool_call_id="t1",
+    )
+    message = command.update["messages"][0]
+    assert "No shortlisted job" in message.content
+    assert "screening" not in command.update
+
+
+def test_format_handoff_renders_only_pursued_jobs():
+    screening = {
+        "42": ScreeningDecision(job_id="42", pursue=True, reason="strong fit"),
+        "43": ScreeningDecision(job_id="43", pursue=False, reason="poor fit"),
+    }
+    text = format_handoff([fake_match("42"), fake_match("43")], screening)
+    assert "[42]" in text and "strong fit" in text
+    assert "[43]" not in text and "poor fit" not in text
+
+    assert "No jobs were selected" in format_handoff([fake_match()], {})
 
 
 def test_generate_reviewed_revises_rejected_drafts(monkeypatch):

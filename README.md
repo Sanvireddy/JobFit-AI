@@ -1,6 +1,6 @@
 # JobFit-AI
 
-JobFit-AI is an end-to-end job-application system: it scrapes LinkedIn job postings, extracts structured requirements with a local LLM, matches jobs to a resume with semantic vector search, and then hands the shortlist to a **LangGraph agent** that decides which jobs are worth pursuing and prepares tailored application materials for each one.
+JobFit-AI is an end-to-end job-application system: it scrapes LinkedIn job postings, extracts structured requirements with a local LLM, matches jobs to a resume with semantic vector search, and then hands the shortlist to a **LangGraph multi-agent team** — a *screener* agent that investigates each job and decides which are worth pursuing, and a *preparer* agent that writes tailored application materials for the selected ones, connected by a typed handoff.
 
 The project is built in two layers with deliberately different designs:
 
@@ -46,13 +46,25 @@ LinkedIn (Voyager API)
  └────────┬─────────┘
           │
           ▼
-     ┌─────────┐  tool calls   ┌───────┐   investigate: analyze_fit,
-     │  agent  ├──────────────►│ tools │     get_job_description,
-     │ (Groq)  │◄──────────────┤       │     check_job_active, research_company
-     └────┬────┘               └───────┘   prepare: tailor_resume,
-          │ no tool calls                    write_cover_letter
-          ▼                                  (draft → LLM review → revise)
- ┌──────────────┐
+    ┌──────────┐  tool calls  ┌────────────────┐   analyze_fit,
+    │ screener ├─────────────►│ screener_tools │   get_job_description,
+    │  (Groq)  │◄─────────────┤                │   check_job_active,
+    └────┬─────┘              └────────────────┘   record_screening_decision
+          │ no tool calls
+          ▼
+     ┌─────────┐   typed handoff: ScreeningDecision per job;
+     │ handoff │   screener summary stashed, message channel
+     └────┬────┘   CLEARED — the preparer starts a fresh context
+          │
+          ├── nothing pursued ─────────────────────────┐
+          ▼                                            │
+    ┌──────────┐  tool calls  ┌────────────────┐       │
+    │ preparer ├─────────────►│ preparer_tools │       │   research_company,
+    │  (Groq)  │◄─────────────┤                │       │   tailor_resume,
+    └────┬─────┘              └────────────────┘       │   write_cover_letter
+          │ no tool calls                              │   (draft → LLM review
+          ▼                                            │      → revise)
+ ┌──────────────┐◄─────────────────────────────────────┘
  │ human_review │   interrupt(): approve/skip each prepared application
  └──────┬───────┘
          ▼
@@ -60,9 +72,10 @@ LinkedIn (Voyager API)
 ```
 
 - `find_jobs` / `extract_metadata` are **deterministic nodes**: embed the resume, search FAISS, apply compatibility filters, enrich with structured requirements. A conditional edge routes to END if matching fails (`state["error"]`).
-- The **agent node** sees the enriched shortlist and loops with a `ToolNode` until it stops emitting tool calls. It works in two phases: *investigate* (a deterministic `analyze_fit` report per job, the full description on demand, an optional LinkedIn liveness check, and company research to ground cover letters), then *prepare*. Tools receive graph state via `InjectedState` and write results back through `Command` updates — the LLM only ever supplies a `job_id`.
+- **Two specialized agents, not one generalist.** The **screener** investigates each shortlisted job (a deterministic `analyze_fit` report, the full description on demand, an optional LinkedIn liveness check) and records a `ScreeningDecision` (pursue/skip + reason) per job. The **preparer** writes materials for the pursued jobs only. Each agent is bound with **only its own tool roster**, so the capability split is enforced at the model level — the screener cannot generate documents, the preparer cannot re-screen.
+- **Typed handoff, isolated contexts.** The agents never share a transcript. The `handoff` node stashes the screener's summary, wipes the message channel (`RemoveMessage(REMOVE_ALL_MESSAGES)`), and the preparer seeds a fresh conversation rendered from `state["screening"]` — all inter-agent communication flows through typed Pydantic state, never prose-in-context. Skipped jobs are recorded with the screener's reason and bypass the preparer entirely.
 - The **generation tools run an evaluator-optimizer loop**: every draft is judged by a structured-output LLM reviewer for truthfulness against the original resume and regenerated with the critique when rejected (the same retry-with-feedback idea as the extraction layer, applied to open-ended generation).
-- **Applying is not a tool.** Prepared materials stop at the `human_review` interrupt; a person approves or skips each job, and only then are statuses set and artifacts saved. The model cannot mark anything applied.
+- **Applying is not a tool.** Prepared materials stop at the `human_review` interrupt; a person approves or skips each job, and only then are statuses set and artifacts saved. Neither agent can mark anything applied.
 
 ## Project structure
 
@@ -145,6 +158,7 @@ The run pauses twice for input when there is something to decide: at intake (wit
 ## Design decisions
 
 - **Deterministic spine, agentic head.** Matching and enrichment are plain graph nodes with explicit conditional edges; the LLM loop only starts once there is a concrete, typed shortlist to reason over. Agents should decide things that need judgment — not run ETL. Even inside the loop, `analyze_fit` is deterministic: it reports facts, and the model supplies the judgment.
+- **Multi-agent where the split earns its keep.** Screening and preparing are different jobs with different tools, different prompts, and different failure modes — so they are different agents with a typed handoff, not one agent with a longer prompt. The split buys enforced capability boundaries (roster-level, not prompt-level), small isolated contexts (the preparer never pays tokens for the screener's investigation transcript), and independently testable roles.
 - **Typed state everywhere, merged by reducers.** `AgentState` is a TypedDict whose fields are Pydantic domain models (`CandidateProfile`, `JobMatch`, `TailoredArtifacts`, `ApplicationRecord`). `messages` appends; `artifacts` and `applications` merge per job (field-wise for artifacts), so the parallel tool calls the model routinely emits in one turn can never clobber each other. `matches` is overwritten wholesale by the node that owns it.
 - **Tools write state via `Command`, not prose.** Action tools receive `InjectedState`, look up the job by id, and return a `Command` with per-job *deltas* to typed fields (`artifacts`, `applications`) plus a `ToolMessage`. Results are never smuggled through free-text messages.
 - **Generation is reviewed, not trusted.** Tailored resumes and cover letters pass an LLM-as-judge truthfulness check (structured output) and are revised with the critique when rejected; the tool result tells the agent whether the final draft passed.
@@ -160,7 +174,7 @@ The run pauses twice for input when there is something to decide: at intake (wit
 python -m pytest tests/
 ```
 
-The suite covers the metadata compatibility filters (including skills / location / visa preferences), metadata rehydration from DB rows, prompt rendering, the fit-report tool, the critique-and-revise loop (revision on rejection, giving up after max rounds), reducer merging under parallel tool calls, and full graph wiring — happy path, error routing, enrichment skipping, and both interrupts (intake and approval) resumed via `Command(resume=...)` — using an injected fake model. No network, database, or API keys required.
+The suite covers the metadata compatibility filters (including skills / location / visa preferences), metadata rehydration from DB rows, prompt rendering, the fit-report tool, the critique-and-revise loop (revision on rejection, giving up after max rounds), reducer merging under parallel tool calls, and full graph wiring — happy path, error routing, enrichment skipping, the two-agent screener → handoff → preparer flow (including an assertion that the preparer starts from a fresh 2-message context, proving isolation), the skip-all path that bypasses the preparer, and both interrupts (intake and approval) resumed via `Command(resume=...)` — using injected fake/scripted models. No network, database, or API keys required.
 
 ## Extraction accuracy evaluation
 

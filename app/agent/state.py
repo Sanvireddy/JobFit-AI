@@ -140,6 +140,23 @@ class TailoredArtifacts(BaseModel):
     )
 
 
+class ScreeningDecision(BaseModel):
+    """The screener agent's verdict on one shortlisted job.
+
+    This is the typed handoff between the two agents: the screener records one
+    decision per job; the preparer only ever sees jobs with ``pursue=True``
+    (rendered by ``format_handoff``) and the reasons behind them.
+    """
+
+    job_id: str = Field(description="Job this decision is about")
+    pursue: bool = Field(
+        description="True to hand the job to the preparer agent for materials"
+    )
+    reason: str = Field(
+        description="One or two sentences justifying the decision"
+    )
+
+
 ApplicationStatus = Literal[
     "shortlisted",
     "tailored",
@@ -192,11 +209,16 @@ class AgentState(TypedDict):
     # preferences (skills, locations, visa) before matching runs.
     interactive: bool
 
-    # Working data produced as the graph runs. Both dicts merge per-key (see
+    # Working data produced as the graph runs. The dicts merge per-key (see
     # merge_dicts) so parallel tool calls can update different jobs safely.
     matches: List[JobMatch]
+    screening: Annotated[Dict[str, ScreeningDecision], merge_dicts]  # keyed by job_id
     artifacts: Annotated[Dict[str, TailoredArtifacts], merge_artifacts]
     applications: Annotated[Dict[str, ApplicationRecord], merge_dicts]
+
+    # The screener agent's closing summary, stashed by the handoff node before
+    # the message channel is cleared for the preparer's isolated context.
+    screener_summary: Optional[str]
 
     # Populated if a node fails, so the graph can route to error handling.
     error: Optional[str]
