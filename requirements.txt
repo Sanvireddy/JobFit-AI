@@ -1,3 +1,6 @@
+# Config
+python-dotenv
+
 # Scraping
 requests
 selenium
@@ -8,6 +11,7 @@ geotext
 pydantic
 numpy
 faiss-cpu
+torch
 
 # Models
 ollama

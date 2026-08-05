@@ -1,5 +1,10 @@
 # Secrets / credentials
+.env
 logins.csv
+
+# Personal inputs (résumé / source documents — contain PII)
+resume.txt
+*.pdf
 
 # Python
 __pycache__/

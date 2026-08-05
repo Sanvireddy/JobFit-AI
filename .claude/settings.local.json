@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -)",
+      "Bash(ls /Library/TeX/texbin/ 2>/dev/null | head -3 || ls /usr/local/texlive/*/bin/*/pdflatex 2>/dev/null || echo \"no TeX distribution found\")",
+      "Bash(python3 -m py_compile app/ingestion/helpers.py)"
+    ]
+  }
+}
