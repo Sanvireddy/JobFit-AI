@@ -118,7 +118,12 @@ python -m venv venv && source venv/bin/activate
 pip install -r requirements.txt        # add -r requirements-dev.txt for tests
 ```
 
-Configuration is environment-driven (see `app/config.py`):
+Configuration is environment-driven (see `app/config.py`). Copy `.env.example` to `.env` and fill in your secrets — every entrypoint auto-loads `.env` at startup (via `python-dotenv` in `app/__init__.py`), so you do **not** need to `export` anything:
+
+```bash
+cp .env.example .env   # then edit .env and set GROQ_API_KEY=gsk_...
+```
+
 
 | Variable | Purpose | Default |
 |---|---|---|
@@ -145,8 +150,9 @@ python -m app.ingestion.build_index
 
 ## Running the agent
 
+`GROQ_API_KEY` is read from `.env` automatically (see [Setup](#setup) above) — no `export` needed.
+
 ```bash
-export GROQ_API_KEY=gsk_...
 python -m app.agent.run path/to/resume.txt --top-k 5 --experience-years 3
 
 # Ask for preferences (must-have skills, locations, visa) before matching:
