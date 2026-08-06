@@ -18,10 +18,29 @@ other tool-capable models; override via ``GROQ_MODEL`` without touching code.
 import os
 from typing import Optional
 
+from langchain_core.rate_limiters import InMemoryRateLimiter
 from langchain_groq import ChatGroq
 
 from app.agent.tools import TOOLS
 from app.config import GROQ_DEFAULT_MODEL as DEFAULT_MODEL
+
+# On Groq's free/on-demand tier the per-minute token budget (TPM) is small, and
+# the agent fires calls in a tight ReAct/evaluator loop — enough to exhaust the
+# window in seconds and get a 429. Two defenses, both env-tunable:
+#   - retry: the Groq SDK honors the API's Retry-After on 429, so a higher retry
+#     budget rides out transient throttles instead of crashing the run.
+#   - pace: a process-wide limiter spaces requests out so the rolling TPM window
+#     can recover between calls.
+GROQ_MAX_RETRIES = int(os.environ.get("GROQ_MAX_RETRIES", "8"))
+# Requests per second, shared across every model built here. Default ~0.1 rps
+# (one call every ~10s) keeps a ~2.5k-token request comfortably under a 12k TPM
+# cap; raise it on paid tiers via GROQ_REQUESTS_PER_SECOND.
+_RPS = float(os.environ.get("GROQ_REQUESTS_PER_SECOND", "0.1"))
+_RATE_LIMITER = InMemoryRateLimiter(
+    requests_per_second=_RPS,
+    check_every_n_seconds=0.5,
+    max_bucket_size=1,
+)
 
 
 def get_agent_model(
@@ -56,6 +75,8 @@ def get_agent_model(
     llm = ChatGroq(
         model=model or os.environ.get("GROQ_MODEL", DEFAULT_MODEL),
         temperature=temperature,
+        max_retries=GROQ_MAX_RETRIES,
+        rate_limiter=_RATE_LIMITER,
     )
 
     if tools is not None:

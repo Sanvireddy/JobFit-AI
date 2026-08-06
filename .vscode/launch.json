@@ -1,0 +1,25 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug agent (resume.txt)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "app.agent.run",
+      "args": ["resume.txt", "--top-k", "5", "--experience-years", "3"],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "justMyCode": false
+    },
+    {
+      "name": "Debug agent (interactive)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "app.agent.run",
+      "args": ["resume.txt", "--interactive"],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "justMyCode": false
+    }
+  ]
+}
