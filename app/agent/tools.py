@@ -31,7 +31,7 @@ This module holds two different kinds of callables, and the distinction matters:
    merge them, which keeps parallel tool calls in one turn safe.
 """
 
-from typing import Annotated, List, Optional
+from typing import Annotated, List, Optional, Union
 
 from langchain_core.messages import ToolMessage
 from langchain_core.tools import InjectedToolCallId, tool
@@ -375,10 +375,24 @@ def check_job_active(
         f"Job {job_id} is still open on LinkedIn.", tool_call_id=tool_call_id)]})
 
 
+def _as_bool(value: Union[bool, str]) -> bool:
+    """Coerce a tool-call ``pursue`` argument to a real bool.
+
+    Llama-family models on Groq are inconsistent about boolean arguments,
+    sometimes emitting the string ``"false"`` instead of ``false``. Groq now
+    validates tool-call args against the schema server-side, so we advertise
+    ``pursue`` as ``bool | str`` (schema ``anyOf``) and normalise here rather
+    than let a stringified boolean 400 the whole run.
+    """
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ("true", "1", "yes", "y")
+
+
 @tool
 def record_screening_decision(
     job_id: str,
-    pursue: bool,
+    pursue: Union[bool, str],
     reason: str,
     state: Annotated[dict, InjectedState],
     tool_call_id: Annotated[str, InjectedToolCallId],
@@ -394,6 +408,7 @@ def record_screening_decision(
         pursue: True to hand the job off for application materials.
         reason: One or two sentences justifying the decision.
     """
+    pursue = _as_bool(pursue)
     match = _find_match(state, job_id)
     if match is None:
         return Command(update={"messages": [ToolMessage(
