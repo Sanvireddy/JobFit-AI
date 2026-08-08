@@ -12,6 +12,7 @@ completes.
 
 Run with:  python -m app.agent.run path/to/resume.txt --top-k 5
 """
+from dotenv import load_dotenv
 
 import argparse
 import logging
@@ -24,6 +25,7 @@ from app.config import OUTPUT_DIR
 
 logger = logging.getLogger(__name__)
 
+load_dotenv()
 
 def save_artifacts(artifacts: dict, skipped_job_ids: set) -> None:
     for job_id, artifact in artifacts.items():
