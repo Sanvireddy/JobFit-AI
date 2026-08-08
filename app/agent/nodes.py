@@ -33,6 +33,7 @@ from langgraph.types import interrupt
 
 from app.agent.state import AgentState, ApplicationRecord
 from app.agent.tools import extract_job_metadata, find_jobs
+from app.observability import add_trace_metadata, add_trace_tags, log_run_feedback
 
 APPROVE_ANSWERS = {"y", "yes", "apply", "approve", "approved"}
 
@@ -90,8 +91,12 @@ def find_jobs_node(state: AgentState) -> dict:
     try:
         matches = find_jobs(state["candidate"], top_k=state.get("top_k", 5))
     except Exception as exc:
+        # Tag the span so this swallowed error is still visible in LangSmith.
+        add_trace_tags("error", "find_jobs_failed")
+        add_trace_metadata(error=str(exc))
         return {"error": f"find_jobs_node failed: {exc}", "matches": []}
 
+    add_trace_metadata(num_matches=len(matches), top_k=state.get("top_k", 5))
     return {"matches": matches}
 
 
@@ -109,6 +114,8 @@ def extract_metadata_node(state: AgentState) -> dict:
     matches = state.get("matches") or []
 
     enriched = []
+    newly_extracted = 0
+    extraction_failures = 0
     for match in matches:
         if match.metadata is None and match.description:
             try:
@@ -117,11 +124,19 @@ def extract_metadata_node(state: AgentState) -> dict:
                 match = match.model_copy(
                     update={"metadata": extract_job_metadata(match.description)}
                 )
+                newly_extracted += 1
             except Exception:
                 # Leave metadata as None on failure; do not abort the batch.
-                pass
+                extraction_failures += 1
         enriched.append(match)
 
+    add_trace_metadata(
+        num_matches=len(matches),
+        newly_extracted=newly_extracted,
+        extraction_failures=extraction_failures,
+    )
+    if extraction_failures:
+        add_trace_tags("extraction_partial_failure")
     return {"matches": enriched}
 
 
@@ -155,12 +170,27 @@ def human_review_node(state: AgentState) -> dict:
         decisions = {}
 
     applications = {}
+    approved_count = 0
     for job_id in artifacts:
         answer = str(decisions.get(job_id, "")).strip().lower()
         approved = answer in APPROVE_ANSWERS
+        approved_count += approved
         applications[job_id] = ApplicationRecord(
             job_id=job_id,
             status="applied" if approved else "skipped",
             notes="approved at human review" if approved else "skipped at human review",
         )
+        # Persist each human verdict as LangSmith feedback.
+        log_run_feedback(
+            "human_review",
+            score=1 if approved else 0,
+            value="applied" if approved else "skipped",
+            comment=f"job {job_id}",
+        )
+
+    add_trace_metadata(
+        reviewed=len(artifacts),
+        approved=approved_count,
+        skipped=len(artifacts) - approved_count,
+    )
     return {"applications": applications}

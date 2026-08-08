@@ -13,6 +13,7 @@ from functools import lru_cache
 import ollama
 
 from app.config import EXTRACTION_PROMPT_PATH, OLLAMA_MODEL
+from app.observability import add_trace_metadata, traceable
 from app.schemas.job_metadata import JobMetadata
 
 logger = logging.getLogger(__name__)
@@ -39,6 +40,25 @@ def _strip_code_fences(content: str) -> str:
     return content.replace("```json", "").replace("```", "").strip()
 
 
+@traceable(run_type="llm", name="ollama.chat")
+def _ollama_chat(prompt: str) -> str:
+    """One local-Ollama completion, traced as an ``llm`` run.
+
+    Ollama is not a LangChain model, so it is invisible to LangSmith without
+    this wrapper; the model's own token counts are surfaced as metadata.
+    """
+    response = ollama.chat(
+        model=OLLAMA_MODEL, messages=[{"role": "user", "content": prompt}]
+    )
+    add_trace_metadata(
+        model=OLLAMA_MODEL,
+        prompt_tokens=response.get("prompt_eval_count"),
+        completion_tokens=response.get("eval_count"),
+    )
+    return response["message"]["content"]
+
+
+@traceable(run_type="chain", name="extract_metadata")
 def extract_metadata(job_description: str, max_retries: int = MAX_RETRIES) -> JobMetadata:
     """Extract validated ``JobMetadata`` from raw job description text.
 
@@ -58,16 +78,16 @@ def extract_metadata(job_description: str, max_retries: int = MAX_RETRIES) -> Jo
                 "Do NOT repeat the same mistake."
             )
 
-        response = ollama.chat(
-            model=OLLAMA_MODEL, messages=[{"role": "user", "content": prompt}]
-        )
-        content = _strip_code_fences(response["message"]["content"])
+        content = _strip_code_fences(_ollama_chat(prompt))
         try:
-            return JobMetadata.model_validate(json.loads(content))
+            result = JobMetadata.model_validate(json.loads(content))
+            add_trace_metadata(attempts=attempt, succeeded=True)
+            return result
         except Exception as exc:
             last_error = str(exc)
             logger.warning("Extraction attempt %d/%d failed: %s", attempt, max_retries, exc)
 
+    add_trace_metadata(attempts=max_retries, succeeded=False, last_error=last_error)
     raise MetadataExtractionError(
         f"Failed to extract valid metadata after {max_retries} attempts: {last_error}"
     )

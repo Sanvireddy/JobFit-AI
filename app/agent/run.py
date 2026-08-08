@@ -16,6 +16,7 @@ from dotenv import load_dotenv
 
 import argparse
 import logging
+import uuid
 
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.types import Command
@@ -99,7 +100,21 @@ def main() -> None:
     # MemorySaver is enough for a single-process CLI run: it lets the graph
     # pause at interrupt() and resume on the same thread_id.
     graph = build_graph(checkpointer=MemorySaver())
-    config = {"configurable": {"thread_id": "cli"}}
+
+    # One id per run, shared by the checkpointer (thread_id) and the LangSmith
+    # trace (metadata.session_id) so the whole run groups into one thread.
+    run_id = f"cli-{uuid.uuid4().hex[:8]}"
+    config = {
+        "configurable": {"thread_id": run_id},
+        "run_name": "jobfit-agent-run",
+        "tags": ["jobfit", "cli"],
+        "metadata": {
+            "session_id": run_id,
+            "top_k": args.top_k,
+            "experience_years": args.experience_years,
+            "interactive": args.interactive,
+        },
+    }
 
     state = graph.invoke(
         initial_state(

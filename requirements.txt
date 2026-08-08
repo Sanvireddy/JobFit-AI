@@ -21,3 +21,6 @@ sentence-transformers
 langgraph
 langchain-core
 langchain-groq
+
+# Observability (LangSmith tracing; gated on LANGSMITH_TRACING)
+langsmith

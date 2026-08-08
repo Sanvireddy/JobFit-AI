@@ -53,6 +53,7 @@ from app.agent.state import (
     ScreeningDecision,
     TailoredArtifacts,
 )
+from app.observability import add_trace_metadata, traceable
 from app.schemas.job_metadata import JobMetadata
 
 # How many times a rejected draft is regenerated with the reviewer's critique
@@ -65,6 +66,7 @@ MAX_REVISION_ROUNDS = 2
 # ---------------------------------------------------------------------------
 
 
+@traceable(run_type="chain", name="find_jobs")
 def find_jobs(candidate: CandidateProfile, top_k: int = 5) -> List[JobMatch]:
     """Find the jobs most relevant to a candidate.
 
@@ -89,6 +91,7 @@ def find_jobs(candidate: CandidateProfile, top_k: int = 5) -> List[JobMatch]:
         requires_visa_sponsorship=candidate.requires_visa_sponsorship,
     )
 
+    add_trace_metadata(top_k=top_k, num_matches=len(matched))
     return [
         JobMatch(
             job_id=job.job_id,
@@ -105,6 +108,7 @@ def find_jobs(candidate: CandidateProfile, top_k: int = 5) -> List[JobMatch]:
     ]
 
 
+@traceable(run_type="chain", name="extract_job_metadata")
 def extract_job_metadata(job_description: str) -> JobMetadata:
     """Extract structured requirements from a single job description.
 
@@ -128,6 +132,7 @@ def _find_match(state: dict, job_id: str) -> Optional[JobMatch]:
     return None
 
 
+@traceable(run_type="chain", name="groq_generate")
 def _groq_generate(system_prompt: str, user_prompt: str) -> str:
     """Single-shot Groq generation used by the tailoring tools.
 
@@ -157,6 +162,7 @@ class DraftReview(BaseModel):
     )
 
 
+@traceable(run_type="chain", name="review_draft")
 def _review_draft(
     kind: str, draft: str, job_description: str, resume_text: str
 ) -> DraftReview:
@@ -179,6 +185,7 @@ def _review_draft(
     )
 
 
+@traceable(run_type="chain", name="generate_reviewed")
 def _generate_reviewed(
     kind: str, system_prompt: str, job_description: str, resume_text: str
 ) -> tuple:
@@ -208,6 +215,7 @@ def _generate_reviewed(
         review = _review_draft(kind, draft, job_description, resume_text)
         rounds += 1
 
+    add_trace_metadata(kind=kind, revision_rounds=rounds, approved=review.approved)
     return draft, review
 
 
@@ -464,6 +472,7 @@ def research_company(company_name: str) -> str:
     abstract = data.get("AbstractText")
     if abstract:
         source = data.get("AbstractSource") or "web"
+        add_trace_metadata(company=company_name, source=source, found=True)
         return f"About {company_name} (source: {source}): {abstract}"
 
     topics = [

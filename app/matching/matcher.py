@@ -20,6 +20,7 @@ from typing import Dict, List, Optional
 from pydantic import BaseModel, Field
 
 from app.db import repository
+from app.observability import add_trace_metadata, traceable
 from app.schemas.job_metadata import (
     ExperienceRequirement,
     HigherEducationRequirement,
@@ -48,6 +49,7 @@ class MatchedJob(BaseModel):
     )
 
 
+@traceable(run_type="parser", name="metadata_from_row")
 def metadata_from_row(row: Optional[Dict]) -> Optional[JobMetadata]:
     """Rebuild a partial ``JobMetadata`` from a flattened job_metadata DB row.
 
@@ -94,6 +96,7 @@ def metadata_from_row(row: Optional[Dict]) -> Optional[JobMetadata]:
     )
 
 
+@traceable(run_type="chain", name="filter_jobs_by_metadata")
 def filter_jobs_by_metadata(
     jobs: List[Dict],
     job_metadata_map: Dict[str, Dict],
@@ -167,9 +170,21 @@ def filter_jobs_by_metadata(
             continue
 
         filtered.append(job)
+
+    add_trace_metadata(
+        jobs_in=len(jobs),
+        jobs_kept=len(filtered),
+        jobs_dropped=len(jobs) - len(filtered),
+        candidate_experience_years=candidate_experience_years,
+        must_have_skills=must_have_skills or [],
+        preferred_locations=preferred_locations or [],
+        open_to_relocation=open_to_relocation,
+        requires_visa_sponsorship=requires_visa_sponsorship,
+    )
     return filtered
 
 
+@traceable(run_type="retriever", name="find_matching_jobs_for_resume")
 def find_matching_jobs_for_resume(
     resume_text: str,
     top_k: int = 10,
@@ -194,6 +209,7 @@ def find_matching_jobs_for_resume(
         logger.warning("FAISS index is empty; run app.ingestion.build_index first.")
         return []
 
+    add_trace_metadata(top_k=top_k, index_size=index.ntotal)
     resume_vector = embed_texts([resume_text])
     scores, indices = index.search(resume_vector, top_k * 2)
     score_by_faiss_index = {

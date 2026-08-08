@@ -70,9 +70,10 @@ from app.agent.prompts import (
 )
 from app.agent.state import AgentState, CandidateProfile
 from app.agent.tools import PREPARER_TOOLS, SCREENER_TOOLS
+from app.observability import add_trace_tags
 
 
-def make_agent_node(model, system_prompt, render_seed):
+def make_agent_node(model, system_prompt, render_seed, role=None):
     """Build one agent node, closing over its model, role prompt, and seed.
 
     On first entry (empty ``messages``) it seeds the conversation with the
@@ -81,9 +82,13 @@ def make_agent_node(model, system_prompt, render_seed):
     reducer). On later loop iterations the conversation already carries
     history, so it just replies. Because the handoff node clears ``messages``,
     the same seeding logic serves both agents.
+
+    ``role`` (``"screener"``/``"preparer"``) tags the node's LangSmith span.
     """
 
     def agent_node(state: AgentState) -> dict:
+        if role:
+            add_trace_tags(role)
         history = list(state.get("messages") or [])
         if history:
             response = model.invoke(history)
@@ -169,6 +174,7 @@ def build_graph(model=None, tools=None, checkpointer=None):
             screener_model,
             SCREENER_SYSTEM_PROMPT,
             lambda state: format_shortlist(state.get("matches") or []),
+            role="screener",
         ),
     )
     builder.add_node("screener_tools", ToolNode(screener_toolset))
@@ -181,6 +187,7 @@ def build_graph(model=None, tools=None, checkpointer=None):
             lambda state: format_handoff(
                 state.get("matches") or [], state.get("screening") or {}
             ),
+            role="preparer",
         ),
     )
     builder.add_node("preparer_tools", ToolNode(preparer_toolset))
