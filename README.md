@@ -197,8 +197,10 @@ To validate the LLM-based metadata extraction layer, 50 job postings were manual
 
 ## Limitations & future work
 
+- **Single-vector representation for job descriptions:** The current retrieval pipeline represents each job description using a single embedding. Since job descriptions contain multiple types of information—such as skills, experience requirements, responsibilities, and other constraints—a single embedding may not represent every requirement equally well. This is a known area for improvement. A future evaluation will compare the current full-document representation against section-level or chunk-based representations using retrieval metrics such as **MRR and NDCG** to determine whether the representation affects retrieval quality.
 - **Persistent sessions**: swap the in-memory checkpointer for `SqliteSaver` so an interrupted run (or a crash mid-loop) can resume across processes, and persist `applications` so past decisions inform future runs.
 - **Two-tower retrieval**: separate resume/job encoders trained on application feedback, replacing the single off-the-shelf embedding model.
 - **Re-ranking** with explainable signals (skill overlap, recency, seniority match) on top of cosine similarity.
-- **Resume parsing** to derive `experience_years` and skills from the resume instead of CLI flags.
 - Scraping depends on LinkedIn's internal API and cookies; it is best-effort and for personal use.
+
+
