@@ -195,9 +195,25 @@ To validate the LLM-based metadata extraction layer, 50 job postings were manual
 
 `only_english_required` and `higher_education_req` are reliable enough for hard filtering. `min_experience_years` at 88% reflects genuine ambiguity in how experience is stated ("senior level", "3–5 years", "some experience preferred") — which is why unknown values are never treated as disqualifying.
 
+### Input size (job descriptions)
+
+Measured across 3,752 job descriptions in `jobs.db`:
+
+| Metric | Words | Tokens* |
+|--------|-------|---------|
+| Median | 585   | ~1,090  |
+| Mean   | 627   | ~1,140  |
+| p95    | 1,135 | ~2,000  |
+| Max    | 3,240 | ~5,900  |
+
+*Token counts are estimated (~0.25 tokens/char); word counts are exact.
+Every description fits within an 8,192-token context window (max ≈ 5,900).
+
 ## Limitations & future work
 
 - **Single-vector representation for job descriptions:** The current retrieval pipeline represents each job description using a single embedding. Since job descriptions contain multiple types of information—such as skills, experience requirements, responsibilities, and other constraints—a single embedding may not represent every requirement equally well. This is a known area for improvement. A future evaluation will compare the current full-document representation against section-level or chunk-based representations using retrieval metrics such as **MRR and NDCG** to determine whether the representation affects retrieval quality.
+- **Context window (local Ollama):** since the model runs locally, set `num_ctx` to what the task actually needs rather than the maximum. A larger window allocates more memory (KV cache) and slows inference even when unused, so size it to the input (one JD + prompt + output fits comfortably in 8,192, Qwen2.5-7B supports up to 32,768).
+- **Check Ollama's default:** Ollama applies a low default `num_ctx` (2,048, or 4,096 in newer versions) regardless of the model's real limit, and **silently truncates** input that exceeds it — no error. At the 2,048 default, ~4% of the current job descriptions would be truncated. Set it explicitly in the call: `ollama.chat(..., options={"num_ctx": 8192})`.
 - **Persistent sessions**: swap the in-memory checkpointer for `SqliteSaver` so an interrupted run (or a crash mid-loop) can resume across processes, and persist `applications` so past decisions inform future runs.
 - **Two-tower retrieval**: separate resume/job encoders trained on application feedback, replacing the single off-the-shelf embedding model.
 - **Re-ranking** with explainable signals (skill overlap, recency, seniority match) on top of cosine similarity.
